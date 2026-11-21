@@ -2,7 +2,7 @@
  * Keep this URL public; NEVER put user tokens, passwords, API keys or secrets here.
  */
 window.APOTEK_PWA_CONFIG = Object.freeze({
-  gasWebAppUrl: "PASTE_YOUR_DEPLOYED_APPS_SCRIPT_EXEC_URL_HERE",
+  gasWebAppUrl: "https://script.google.com/macros/s/AKfycbxhtRJl_oxPdQDS5adWc7b6sANfeDkEcdhuqfkaZb85gSPPcoPyVKRmD9fyinjLkunw1Q/exec",
   appLabel: "APOTEK · SMART POS",
   shellVersion: "1.0.0"
 });
