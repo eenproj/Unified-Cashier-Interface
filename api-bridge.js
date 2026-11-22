@@ -1,19 +1,173 @@
-/* APOTEK PWA API Bridge Client v1.2
- * Credentials are memory-only. A page reload requires a fresh login.
- * The legacy Apps Script token is never exposed to this origin.
+/* APOTEK PWA API Bridge Client v1.4.2 — Hotfix 4.2
+ * Response delivery assurance, frame diagnostics and request correlation.
+ * Credentials remain memory-only. Diagnostic records never contain payloads or tokens.
  */
 (() => {
   "use strict";
-  const cfg=window.APOTEK_PWA_CONFIG||{},endpoint=String(cfg.gasWebAppUrl||"").trim();
-  const pending=new Map(),GOOGLE_RESPONSE_ORIGINS=new Set(["https://script.google.com","https://script.googleusercontent.com"]);
-  let iframe=null,auth={accessToken:"",refreshToken:"",accessDeadline:0,user:null,tenant:null};
-  function validEndpoint(v){return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(v);}
-  function ensureFrame(){if(iframe&&iframe.isConnected)return iframe;iframe=document.createElement("iframe");iframe.name="apotek_pwa_gateway_"+crypto.randomUUID();iframe.title="APOTEK API Gateway";iframe.setAttribute("aria-hidden","true");iframe.style.cssText="position:absolute;width:1px;height:1px;left:-10000px;border:0";document.body.appendChild(iframe);return iframe;}
-  function makeId(){const b=new Uint8Array(24);crypto.getRandomValues(b);return Array.from(b,x=>x.toString(16).padStart(2,"0")).join("");}
-  function rawPost(method,args){if(!validEndpoint(endpoint))return Promise.reject(new Error("URL Apps Script belum dikonfigurasi."));if(!navigator.onLine)return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));const id=makeId(),frame=ensureFrame();return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));},45000);pending.set(id,{resolve,reject,timer});const form=document.createElement("form");form.method="POST";form.action=endpoint;form.target=frame.name;form.acceptCharset="UTF-8";form.style.display="none";const fields={mode:"pwa_api_v1",payloadVersion:"1",method,requestId:id,origin:location.origin,args:JSON.stringify(args)};for(const [k,v] of Object.entries(fields)){const input=document.createElement("input");input.type="hidden";input.name=k;input.value=String(v);form.appendChild(input);}document.body.appendChild(form);try{form.submit();}catch(e){clearTimeout(timer);pending.delete(id);form.remove();reject(e);return;}setTimeout(()=>form.remove(),1000);});}
-  window.addEventListener("message",e=>{if(!GOOGLE_RESPONSE_ORIGINS.has(e.origin))return;const d=e.data;if(!d||d.channel!=="APOTEK_PWA_GATEWAY_V1"||!d.requestId)return;const p=pending.get(String(d.requestId));if(!p)return;clearTimeout(p.timer);pending.delete(String(d.requestId));if(!d.result||d.result.ok!==true){p.reject(new Error(String(d.result&&d.result.message||"Permintaan API gagal.")));return;}p.resolve(d.result.data);});
-  function applyAuth(r){if(!r||r.ok!==true||!r.accessToken||!r.refreshToken)throw new Error(r&&r.message||"Respons autentikasi tidak valid.");auth={accessToken:r.accessToken,refreshToken:r.refreshToken,accessDeadline:Date.now()+Math.max(30,Number(r.accessExpiresIn)||900)*1000,user:r.user||null,tenant:r.tenant||null};return {ok:true,user:auth.user,tenant:auth.tenant,profileComplete:r.profileComplete,profileMissing:r.profileMissing,expiresIn:r.accessExpiresIn*1000};}
-  async function ensureAccess(){if(auth.accessToken&&Date.now()<auth.accessDeadline-30000)return auth.accessToken;if(!auth.refreshToken)throw new Error("Sesi tidak tersedia. Silakan login.");const r=await rawPost("pwaRefreshV12",[auth.refreshToken]);applyAuth(r);return auth.accessToken;}
-  const bridge={version:"1.2.0",getUser(){return auth.user;},getTenant(){return auth.tenant;},async getAccessToken(){return ensureAccess();},isAuthenticated(){return !!auth.accessToken;},async login(email,password){const r=await rawPost("pwaLoginV12",[String(email||""),String(password||"")]);return applyAuth(r);},async refresh(){return ensureAccess();},async logout(){const token=auth.accessToken;try{if(token||auth.refreshToken)await rawPost("pwaLogoutV12",[token,auth.refreshToken]);}finally{auth={accessToken:"",refreshToken:"",accessDeadline:0,user:null,tenant:null};}},async call(method,args){method=String(method);args=Array.isArray(args)?args.slice():[];if(method==="login")return this.login(args[0],args[1]);if(method==="logout")return this.logout();if(["requestPasswordReset","validatePasswordResetToken","completePasswordReset"].includes(method))return rawPost(method,args);const access=await ensureAccess();if(method==="validateSession"){const r=await rawPost("validateSession",[access]);return r;}if(args.length)args[0]=access;else args.unshift(access);return rawPost(method,args);}};
-  window.ApotekApiBridge=Object.freeze(bridge);
+  const cfg = window.APOTEK_PWA_CONFIG || {};
+  const endpoint = String(cfg.gasWebAppUrl || "").trim();
+  const pending = new Map();
+  let iframe = null;
+  let lastDiagnostic = null;
+  const diagnostics = [];
+  const MAX_DIAGNOSTICS = 80;
+  let auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
+
+  function record(stage, detail) {
+    const item = Object.assign({ tag:"APOTEK_PWA_BRIDGE_DIAG", stage, at:new Date().toISOString() }, detail || {});
+    diagnostics.push(item);
+    if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.shift();
+    lastDiagnostic = item;
+    try { console.info("[APOTEK_PWA_BRIDGE]", JSON.stringify(item)); } catch (_) {}
+    return item;
+  }
+  function trustedGoogleResponseOrigin(origin) {
+    try {
+      const u = new URL(origin);
+      const h = u.hostname.toLowerCase();
+      return u.protocol === "https:" && (
+        h === "script.google.com" ||
+        h === "script.googleusercontent.com" ||
+        h.endsWith(".script.googleusercontent.com") ||
+        h.endsWith("-script.googleusercontent.com")
+      );
+    } catch (_) { return false; }
+  }
+  function validEndpoint(v) {
+    return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(v);
+  }
+  function ensureFrame() {
+    if (iframe && iframe.isConnected) return iframe;
+    iframe = document.createElement("iframe");
+    iframe.name = "apotek_pwa_gateway_" + (crypto.randomUUID ? crypto.randomUUID() : makeId());
+    iframe.title = "APOTEK API Gateway";
+    iframe.setAttribute("aria-hidden", "true");
+    iframe.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
+    document.body.appendChild(iframe);
+    record("FRAME_READY", { frameName:iframe.name });
+    return iframe;
+  }
+  function makeId() {
+    const b = new Uint8Array(24);
+    crypto.getRandomValues(b);
+    return Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+  }
+  function settleMessage(event, data) {
+    const id = String(data.requestId || "");
+    const p = pending.get(id);
+    if (!p) { record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin }); return; }
+    // Acknowledge the exact response frame. Backend retries stop after this ACK.
+    try {
+      event.source && event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id }, event.origin);
+      record("MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+    } catch (ackError) {
+      record("MESSAGE_ACK_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160) });
+    }
+    clearTimeout(p.timer);
+    pending.delete(id);
+    if (!data.result || data.result.ok !== true) {
+      record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      p.reject(new Error(String(data.result && data.result.message || "Permintaan API gagal.")));
+      return;
+    }
+    record("MESSAGE_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+    p.resolve(data.result.data);
+  }
+  window.addEventListener("message", event => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.channel !== "APOTEK_PWA_GATEWAY_V1") return;
+    const id = String(data.requestId || "");
+    if (!trustedGoogleResponseOrigin(event.origin)) {
+      record("MESSAGE_REJECTED_ORIGIN", { requestIdPrefix:id.slice(0,12), origin:String(event.origin || "").slice(0,180) });
+      return;
+    }
+    if (!/^[A-Za-z0-9_-]{16,100}$/.test(id)) {
+      record("MESSAGE_REJECTED_REQUEST_ID", { origin:event.origin });
+      return;
+    }
+    settleMessage(event, data);
+  });
+
+  function rawPost(method, args) {
+    if (!validEndpoint(endpoint)) return Promise.reject(new Error("URL Apps Script belum dikonfigurasi."));
+    if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
+    const id = makeId();
+    const frame = ensureFrame();
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), elapsedMs:Date.now()-startedAt, lastMessageStage:lastDiagnostic && lastDiagnostic.stage || null });
+        reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));
+      }, 45000);
+      pending.set(id, { resolve, reject, timer, startedAt, method:String(method) });
+      record("REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), frameName:frame.name, endpointHost:(new URL(endpoint)).host });
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = endpoint;
+      form.target = frame.name;
+      form.acceptCharset = "UTF-8";
+      form.style.display = "none";
+      const fields = { mode:"pwa_api_v1", payloadVersion:"1", method, requestId:id, origin:location.origin, args:JSON.stringify(args) };
+      for (const [key, value] of Object.entries(fields)) {
+        const input = document.createElement("input");
+        input.type = "hidden"; input.name = key; input.value = String(value);
+        form.appendChild(input);
+      }
+      document.body.appendChild(form);
+      try {
+        form.submit();
+        record("REQUEST_SUBMIT_CALLED", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60) });
+      } catch (error) {
+        clearTimeout(timer); pending.delete(id); form.remove();
+        record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
+        reject(error); return;
+      }
+      setTimeout(() => form.remove(), 1000);
+    });
+  }
+
+  function applyAuth(r) {
+    if (!r || r.ok !== true || !r.accessToken || !r.refreshToken) throw new Error(r && r.message || "Respons autentikasi tidak valid.");
+    auth = { accessToken:r.accessToken, refreshToken:r.refreshToken, accessDeadline:Date.now()+Math.max(30,Number(r.accessExpiresIn)||900)*1000, user:r.user||null, tenant:r.tenant||null };
+    return { ok:true, user:auth.user, tenant:auth.tenant, profileComplete:r.profileComplete, profileMissing:r.profileMissing, expiresIn:r.accessExpiresIn*1000 };
+  }
+  async function ensureAccess() {
+    if (auth.accessToken && Date.now() < auth.accessDeadline-30000) return auth.accessToken;
+    if (!auth.refreshToken) throw new Error("Sesi tidak tersedia. Silakan login.");
+    const r = await rawPost("pwaRefreshV12", [auth.refreshToken]);
+    applyAuth(r);
+    return auth.accessToken;
+  }
+  const bridge = {
+    version:"1.4.2",
+    getDiagnostics() { return diagnostics.slice(); },
+    getLastDiagnostic() { return lastDiagnostic; },
+    clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
+    getUser() { return auth.user; },
+    getTenant() { return auth.tenant; },
+    async getAccessToken() { return ensureAccess(); },
+    isAuthenticated() { return !!auth.accessToken; },
+    async login(email,password) { const r=await rawPost("pwaLoginV12", [String(email||""),String(password||"")]); return applyAuth(r); },
+    async refresh() { return ensureAccess(); },
+    async logout() {
+      const access=auth.accessToken, refresh=auth.refreshToken;
+      try { if (access || refresh) await rawPost("pwaLogoutV12", [access,refresh]); }
+      finally { auth={accessToken:"",refreshToken:"",accessDeadline:0,user:null,tenant:null}; }
+    },
+    async call(method,args) {
+      method=String(method); args=Array.isArray(args)?args.slice():[];
+      if (method==="login") return this.login(args[0],args[1]);
+      if (method==="logout") return this.logout();
+      if (["requestPasswordReset","validatePasswordResetToken","completePasswordReset"].includes(method)) return rawPost(method,args);
+      const access=await ensureAccess();
+      if (method==="validateSession") return rawPost("validateSession",[access]);
+      if (args.length) args[0]=access; else args.unshift(access);
+      return rawPost(method,args);
+    }
+  };
+  window.ApotekApiBridge = Object.freeze(bridge);
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), last:() => bridge.getLastDiagnostic(), clear:() => bridge.clearDiagnostics() });
+  record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
