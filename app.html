@@ -4607,14 +4607,25 @@ async function init(isRetry=false){
  restoreBarcodeScannerSession_();
  showSessionBootstrap(isRetry?'Menghubungkan kembali ke server...':'Memeriksa sesi aplikasi...');
  if(APOTEK_PWA_MODE){
-  setPwaSessionSentinel_();
   const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=false;
-  if(TOKEN){
-   try{const r=await call('validateSession',TOKEN);if(r&&r.ok){USER=r.user;ACTIVE_TENANT_CODE=String(USER?.tenantCode||'DEFAULT').trim().toUpperCase();localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}}
-   catch(e){console.warn('[PWA] Validasi sesi gagal:',e&&e.message||e);}
-   await window.ApotekApiBridge.logout().catch(()=>{});TOKEN='';showLoginScreen('Sesi tidak tersedia atau telah berakhir. Silakan masuk kembali.');return false;
+  try{
+   // Refresh credential is tab-scoped in sessionStorage; access token remains memory-only.
+   // Restore rotates the one-time refresh token before any protected API call.
+   const restored=await window.ApotekApiBridge.restoreSession();
+   setPwaSessionSentinel_();
+   if(restored&&restored.ok&&TOKEN){
+    const r=await call('validateSession',TOKEN);
+    if(r&&r.ok){USER=r.user;ACTIVE_TENANT_CODE=String(USER?.tenantCode||'DEFAULT').trim().toUpperCase();localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}
+    await window.ApotekApiBridge.logout().catch(()=>{});
+    TOKEN='';showLoginScreen(r?.message||'Sesi tidak tersedia atau telah berakhir. Silakan masuk kembali.');return false;
+   }
+   showLoginScreen(restored?.message||'');return false;
+  }catch(e){
+   console.warn('[PWA] Pemulihan sesi ditunda:',e&&e.message||e);
+   // A transport failure is not proof that the session expired. Keep the
+   // refresh credential and let the user retry validation without re-login.
+   showSessionBootstrap('',true);return false;
   }
-  showLoginScreen();return false;
  }
  const savedToken=localStorage.getItem('apotek_token')||sessionStorage.getItem('apotek_token')||'';
  const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=!!localStorage.getItem('apotek_token');
