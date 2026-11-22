@@ -36,16 +36,29 @@
   function validEndpoint(v) {
     return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(v);
   }
-  function ensureFrame() {
-    if (iframe && iframe.isConnected) return iframe;
-    iframe = document.createElement("iframe");
-    iframe.name = "apotek_pwa_gateway_" + (crypto.randomUUID ? crypto.randomUUID() : makeId());
-    iframe.title = "APOTEK API Gateway";
-    iframe.setAttribute("aria-hidden", "true");
-    iframe.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
-    document.body.appendChild(iframe);
-    record("FRAME_READY", { frameName:iframe.name });
-    return iframe;
+  // Each in-flight request owns a dedicated iframe. Reusing one iframe lets
+  // concurrent form submissions navigate over each other's response documents.
+  function createFrame(requestId) {
+    const frame = document.createElement("iframe");
+    frame.name = "apotek_pwa_gateway_" + requestId;
+    frame.title = "APOTEK API Gateway";
+    frame.setAttribute("aria-hidden", "true");
+    frame.tabIndex = -1;
+    frame.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
+    document.body.appendChild(frame);
+    record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12) });
+    return frame;
+  }
+  function clearAuthStorage() {
+    try { sessionStorage.removeItem("apotek_pwa_refresh_v12"); } catch (_) {}
+  }
+  function persistRefreshToken(token) {
+    try {
+      if (token) sessionStorage.setItem("apotek_pwa_refresh_v12", String(token));
+      else clearAuthStorage();
+    } catch (error) {
+      record("SESSION_STORAGE_UNAVAILABLE", { error:String(error && error.message || error).slice(0,120) });
+    }
   }
   function makeId() {
     const b = new Uint8Array(24);
@@ -65,6 +78,7 @@
     }
     clearTimeout(p.timer);
     pending.delete(id);
+    if (p.frame && p.frame.isConnected) p.frame.remove();
     if (!data.result || data.result.ok !== true) {
       record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       p.reject(new Error(String(data.result && data.result.message || "Permintaan API gagal.")));
@@ -93,44 +107,69 @@
     if (!validEndpoint(endpoint)) return Promise.reject(new Error("URL Apps Script belum dikonfigurasi."));
     if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
     const id = makeId();
-    const frame = ensureFrame();
+    const frame = createFrame(id);
+    const retryableLifecycle = ["pwaLoginV12", "pwaRefreshV12", "pwaLogoutV12"].includes(String(method));
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
+      let attempts = 0;
+      let retryTimer = null;
       const timer = setTimeout(() => {
+        if (retryTimer) clearTimeout(retryTimer);
         pending.delete(id);
-        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), elapsedMs:Date.now()-startedAt, lastMessageStage:lastDiagnostic && lastDiagnostic.stage || null });
+        if (frame.isConnected) frame.remove();
+        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:Date.now()-startedAt, lastMessageStage:lastDiagnostic && lastDiagnostic.stage || null });
         reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));
       }, 45000);
-      pending.set(id, { resolve, reject, timer, startedAt, method:String(method) });
-      record("REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), frameName:frame.name, endpointHost:(new URL(endpoint)).host });
-      const form = document.createElement("form");
-      form.method = "POST";
-      form.action = endpoint;
-      form.target = frame.name;
-      form.acceptCharset = "UTF-8";
-      form.style.display = "none";
-      const fields = { mode:"pwa_api_v1", payloadVersion:"1", method, requestId:id, origin:location.origin, args:JSON.stringify(args) };
-      for (const [key, value] of Object.entries(fields)) {
-        const input = document.createElement("input");
-        input.type = "hidden"; input.name = key; input.value = String(value);
-        form.appendChild(input);
+      const p = { resolve, reject, timer, startedAt, method:String(method), frame };
+      pending.set(id, p);
+      function submitAttempt(isRetry) {
+        if (!navigator.onLine) return;
+        attempts++;
+        record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host });
+        const form = document.createElement("form");
+        form.method = "POST";
+        form.action = endpoint;
+        form.target = frame.name;
+        form.acceptCharset = "UTF-8";
+        form.style.display = "none";
+        const fields = { mode:"pwa_api_v1", payloadVersion:"1", method, requestId:id, origin:location.origin, args:JSON.stringify(args) };
+        for (const [key, value] of Object.entries(fields)) {
+          const input = document.createElement("input");
+          input.type = "hidden"; input.name = key; input.value = String(value);
+          form.appendChild(input);
+        }
+        document.body.appendChild(form);
+        try {
+          form.submit();
+          record("REQUEST_SUBMIT_CALLED", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts });
+        } catch (error) {
+          form.remove();
+          if (attempts < (retryableLifecycle ? 3 : 1)) {
+            retryTimer = setTimeout(() => submitAttempt(true), 1200 * attempts);
+          } else {
+            clearTimeout(timer); pending.delete(id); if (frame.isConnected) frame.remove();
+            record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
+            reject(error);
+          }
+          return;
+        }
+        setTimeout(() => form.remove(), 1000);
       }
-      document.body.appendChild(form);
-      try {
-        form.submit();
-        record("REQUEST_SUBMIT_CALLED", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60) });
-      } catch (error) {
-        clearTimeout(timer); pending.delete(id); form.remove();
-        record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
-        reject(error); return;
+      submitAttempt(false);
+      // Retry only lifecycle operations. Server-side requestId replay protection
+      // makes a repeated login/refresh/logout return the original result safely.
+      if (retryableLifecycle) {
+        retryTimer = setTimeout(() => {
+          if (pending.has(id) && attempts < 2) submitAttempt(true);
+        }, 9000);
       }
-      setTimeout(() => form.remove(), 1000);
     });
   }
 
   function applyAuth(r) {
     if (!r || r.ok !== true || !r.accessToken || !r.refreshToken) throw new Error(r && r.message || "Respons autentikasi tidak valid.");
     auth = { accessToken:r.accessToken, refreshToken:r.refreshToken, accessDeadline:Date.now()+Math.max(30,Number(r.accessExpiresIn)||900)*1000, user:r.user||null, tenant:r.tenant||null };
+    persistRefreshToken(auth.refreshToken);
     return { ok:true, user:auth.user, tenant:auth.tenant, profileComplete:r.profileComplete, profileMissing:r.profileMissing, expiresIn:r.accessExpiresIn*1000 };
   }
   async function ensureAccess() {
@@ -140,8 +179,31 @@
     applyAuth(r);
     return auth.accessToken;
   }
+  async function restoreSession() {
+    if (auth.accessToken && Date.now() < auth.accessDeadline-30000) return { ok:true, user:auth.user, tenant:auth.tenant };
+    let saved = "";
+    try { saved = sessionStorage.getItem("apotek_pwa_refresh_v12") || ""; } catch (_) {}
+    if (!saved) return { ok:false, authenticated:false };
+    auth.refreshToken = saved;
+    try {
+      const r = await rawPost("pwaRefreshV12", [saved]);
+      const result = applyAuth(r);
+      record("SESSION_RESTORED", { tenantPresent:!!auth.tenant, userPresent:!!auth.user });
+      return result;
+    } catch (error) {
+      const message = String(error && error.message || error);
+      if (/berakhir|kedaluwarsa|telah digunakan|tidak valid|tidak cocok|silakan login/i.test(message)) {
+        auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
+        clearAuthStorage();
+        record("SESSION_REJECTED", { reason:"refresh_token_invalid" });
+        return { ok:false, authenticated:false, expired:true, message };
+      }
+      record("SESSION_RESTORE_DEFERRED", { reason:"transport_or_server_unavailable" });
+      throw error;
+    }
+  }
   const bridge = {
-    version:"1.4.2",
+    version:"1.4.3",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
@@ -149,12 +211,13 @@
     getTenant() { return auth.tenant; },
     async getAccessToken() { return ensureAccess(); },
     isAuthenticated() { return !!auth.accessToken; },
+    async restoreSession() { return restoreSession(); },
     async login(email,password) { const r=await rawPost("pwaLoginV12", [String(email||""),String(password||"")]); return applyAuth(r); },
     async refresh() { return ensureAccess(); },
     async logout() {
       const access=auth.accessToken, refresh=auth.refreshToken;
       try { if (access || refresh) await rawPost("pwaLogoutV12", [access,refresh]); }
-      finally { auth={accessToken:"",refreshToken:"",accessDeadline:0,user:null,tenant:null}; }
+      finally { auth={accessToken:"",refreshToken:"",accessDeadline:0,user:null,tenant:null}; clearAuthStorage(); }
     },
     async call(method,args) {
       method=String(method); args=Array.isArray(args)?args.slice():[];
