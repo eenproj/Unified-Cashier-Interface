@@ -1,9 +1,7 @@
-/* Configure the deployed Google Apps Script Web App URL.
- * Keep this URL public; NEVER put user tokens, passwords, API keys or secrets here.
- */
-window.APOTEK_PWA_CONFIG = Object.freeze({
-  gasWebAppUrl: "https://script.google.com/macros/s/AKfycbxhtRJl_oxPdQDS5adWc7b6sANfeDkEcdhuqfkaZb85gSPPcoPyVKRmD9fyinjLkunw1Q/exec",
-  appLabel: "APOTEK · SMART POS",
+/* Konfigurasi publik saja. Jangan pernah menaruh password/token/secret di sini. */
+window.APOTEK_PWA_CONFIG=Object.freeze({
+  gasWebAppUrl:"PASTE_DEPLOYED_APPS_SCRIPT_EXEC_URL_HERE",
+  appLabel:"APOTEK · SMART POS",
   apiProtocol:"pwa_api_v1",
   shellVersion:"1.4.0",
   auth:{accessTokenTtlSeconds:900,refreshTokenTtlSeconds:21600,storage:"memory-only"}
