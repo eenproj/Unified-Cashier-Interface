@@ -7613,9 +7613,10 @@ document.addEventListener('keydown',function(e){
   }
   return;
  }
- if(e.key.length===1){
+ const pressedKey=String(e.key||'');
+ if(pressedKey.length===1){
   if(!BARCODE_BUFFER)window._barcodeBufferStart=now;
-  BARCODE_BUFFER+=e.key;
+  BARCODE_BUFFER+=pressedKey;
   if(BARCODE_BUFFER.length>UNIFIED_BARCODE_ENGINE.maxLength)BARCODE_BUFFER=BARCODE_BUFFER.slice(-UNIFIED_BARCODE_ENGINE.maxLength);
  }
 },true);
