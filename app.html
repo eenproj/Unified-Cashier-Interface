@@ -4588,6 +4588,7 @@ async function refreshSidebarBadges(){
 }
 
 let APP_INIT_PROMISE=null;
+let SESSION_RECOVERY_ATTEMPTS=0;
 function showSessionBootstrap(message='Memeriksa sesi aplikasi...',recovery=false){
  const el=$('sessionBootstrap');if(!el)return;
  el.classList.remove('hidden');
@@ -4595,43 +4596,73 @@ function showSessionBootstrap(message='Memeriksa sesi aplikasi...',recovery=fals
   <span class="session-bootstrap-spinner" ${recovery?'style="display:none"':''}></span>
   <strong>${esc(recovery?'Sesi belum dapat diverifikasi':message)}</strong>
   <span>${esc(recovery?'Koneksi ke server sedang bermasalah. Sesi Anda tetap disimpan dan tidak dikeluarkan.':'Mohon tunggu sebentar.')}</span>
-  ${recovery?'<div class="session-recovery-actions"><button class="btn primary" type="button" onclick="retrySessionValidation()">Coba Lagi</button></div>':''}
+  ${recovery?'<div class="session-recovery-actions"><button id="retrySessionValidationBtn" class="btn primary" type="button" onclick="retrySessionValidation()">Coba Lagi</button></div>':''}
  </div>`;
 }
 async function retrySessionValidation(){
  if(APP_INIT_PROMISE)return APP_INIT_PROMISE;
- APP_INIT_PROMISE=init(true).finally(()=>{APP_INIT_PROMISE=null;});
- return APP_INIT_PROMISE;
+ const btn=$('retrySessionValidationBtn');
+ if(btn){btn.disabled=true;btn.textContent='Menghubungkan...';btn.setAttribute('aria-busy','true');}
+ SESSION_RECOVERY_ATTEMPTS++;
+ showSessionBootstrap('Menghubungkan kembali ke server...');
+ try{return await init(true);}
+ catch(error){
+  console.warn('[PWA] Retry pemulihan sesi gagal:',error&&error.message||error);
+  showSessionBootstrap('',true);
+  return false;
+ }
 }
-async function init(isRetry=false){
- restoreBarcodeScannerSession_();
+async function initCore(isRetry=false){
  showSessionBootstrap(isRetry?'Menghubungkan kembali ke server...':'Memeriksa sesi aplikasi...');
- if(APOTEK_PWA_MODE){
-  const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=false;
-  try{
-   // Refresh credential is tab-scoped in sessionStorage; access token remains memory-only.
-   // Restore rotates the one-time refresh token before any protected API call.
-   const restored=await window.ApotekApiBridge.restoreSession();
+ try{
+  // Keep all startup work inside the recovery boundary. A scanner/session
+  // helper exception must not leave the overlay in a dead, non-retryable state.
+  restoreBarcodeScannerSession_();
+  if(APOTEK_PWA_MODE){
+   const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=false;
+   const restored=await window.ApotekApiBridge.restoreSession({forceRefresh:!!isRetry});
    setPwaSessionSentinel_();
    if(restored&&restored.ok&&TOKEN){
     const r=await call('validateSession',TOKEN);
-    if(r&&r.ok){USER=r.user;ACTIVE_TENANT_CODE=String(USER?.tenantCode||'DEFAULT').trim().toUpperCase();localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}
+    if(r&&r.ok){
+     USER=r.user;
+     ACTIVE_TENANT_CODE=String(USER?.tenantCode||'DEFAULT').trim().toUpperCase();
+     localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);
+     OFFLINE_MODE=false;
+     $('sessionBootstrap')?.classList.add('hidden');
+     SESSION_RECOVERY_ATTEMPTS=0;
+     await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();
+     return true;
+    }
     await window.ApotekApiBridge.logout().catch(()=>{});
     TOKEN='';showLoginScreen(r?.message||'Sesi tidak tersedia atau telah berakhir. Silakan masuk kembali.');return false;
    }
    showLoginScreen(restored?.message||'');return false;
-  }catch(e){
-   console.warn('[PWA] Pemulihan sesi ditunda:',e&&e.message||e);
-   // A transport failure is not proof that the session expired. Keep the
-   // refresh credential and let the user retry validation without re-login.
-   showSessionBootstrap('',true);return false;
   }
+  const savedToken=localStorage.getItem('apotek_token')||sessionStorage.getItem('apotek_token')||'';
+  const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=!!localStorage.getItem('apotek_token');
+  TOKEN=savedToken;
+  if(TOKEN){
+   const r=await call('validateSession',TOKEN);
+   if(r&&r.ok){USER=r.user;OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}
+   localStorage.removeItem('apotek_token');sessionStorage.removeItem('apotek_token');TOKEN='';
+   showLoginScreen(r?.message||'Sesi telah berakhir. Silakan masuk kembali.');return false;
+  }
+  showLoginScreen();return false;
+ }catch(e){
+  console.warn('[PWA] Pemulihan sesi ditunda:',e&&e.message||e);
+  OFFLINE_MODE=false;
+  if(!APOTEK_PWA_MODE)USER=null;
+  // A transport/server failure is not proof of expiry. Preserve the refresh
+  // credential and expose a live retry control rather than forcing login.
+  showSessionBootstrap('',true);
+  return false;
  }
- const savedToken=localStorage.getItem('apotek_token')||sessionStorage.getItem('apotek_token')||'';
- const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=!!localStorage.getItem('apotek_token');
- TOKEN=savedToken;
- if(TOKEN){try{const r=await call('validateSession',TOKEN);if(r&&r.ok){USER=r.user;OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}localStorage.removeItem('apotek_token');sessionStorage.removeItem('apotek_token');TOKEN='';showLoginScreen(r?.message||'Sesi telah berakhir. Silakan masuk kembali.');return false;}catch(e){OFFLINE_MODE=false;USER=null;showSessionBootstrap('',true);return false;}}
- showLoginScreen();return false;
+}
+function init(isRetry=false){
+ if(APP_INIT_PROMISE)return APP_INIT_PROMISE;
+ APP_INIT_PROMISE=initCore(isRetry);
+ return APP_INIT_PROMISE.finally(()=>{APP_INIT_PROMISE=null;});
 }
 
 function toggleLoginPassword(){
