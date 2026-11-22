@@ -9,6 +9,8 @@
   const pending = new Map();
   let iframe = null;
   let lastDiagnostic = null;
+  let refreshPromise = null;
+  let restorePromise = null;
   const diagnostics = [];
   const MAX_DIAGNOSTICS = 80;
   let auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
@@ -172,38 +174,60 @@
     persistRefreshToken(auth.refreshToken);
     return { ok:true, user:auth.user, tenant:auth.tenant, profileComplete:r.profileComplete, profileMissing:r.profileMissing, expiresIn:r.accessExpiresIn*1000 };
   }
-  async function ensureAccess() {
+  async function refreshAccessSingleFlight() {
     if (auth.accessToken && Date.now() < auth.accessDeadline-30000) return auth.accessToken;
     if (!auth.refreshToken) throw new Error("Sesi tidak tersedia. Silakan login.");
-    const r = await rawPost("pwaRefreshV12", [auth.refreshToken]);
-    applyAuth(r);
-    return auth.accessToken;
+    if (refreshPromise) return refreshPromise;
+    const token = auth.refreshToken;
+    refreshPromise = (async () => {
+      const r = await rawPost("pwaRefreshV12", [token]);
+      applyAuth(r);
+      record("ACCESS_TOKEN_REFRESHED", { accessExpiresIn:Number(r.accessExpiresIn)||0 });
+      return auth.accessToken;
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
   }
-  async function restoreSession() {
-    if (auth.accessToken && Date.now() < auth.accessDeadline-30000) return { ok:true, user:auth.user, tenant:auth.tenant };
-    let saved = "";
-    try { saved = sessionStorage.getItem("apotek_pwa_refresh_v12") || ""; } catch (_) {}
-    if (!saved) return { ok:false, authenticated:false };
-    auth.refreshToken = saved;
-    try {
-      const r = await rawPost("pwaRefreshV12", [saved]);
-      const result = applyAuth(r);
-      record("SESSION_RESTORED", { tenantPresent:!!auth.tenant, userPresent:!!auth.user });
-      return result;
-    } catch (error) {
-      const message = String(error && error.message || error);
-      if (/berakhir|kedaluwarsa|telah digunakan|tidak valid|tidak cocok|silakan login/i.test(message)) {
-        auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
-        clearAuthStorage();
-        record("SESSION_REJECTED", { reason:"refresh_token_invalid" });
-        return { ok:false, authenticated:false, expired:true, message };
+  async function ensureAccess() {
+    if (auth.accessToken && Date.now() < auth.accessDeadline-30000) return auth.accessToken;
+    return refreshAccessSingleFlight();
+  }
+  async function restoreSession(options) {
+    options = options || {};
+    if (restorePromise) return restorePromise;
+    restorePromise = (async () => {
+      if (!options.forceRefresh && auth.accessToken && Date.now() < auth.accessDeadline-30000) {
+        return { ok:true, user:auth.user, tenant:auth.tenant };
       }
-      record("SESSION_RESTORE_DEFERRED", { reason:"transport_or_server_unavailable" });
-      throw error;
-    }
+      let saved = auth.refreshToken || "";
+      if (!saved) {
+        try { saved = sessionStorage.getItem("apotek_pwa_refresh_v12") || ""; } catch (_) {}
+      }
+      if (!saved) return { ok:false, authenticated:false };
+      // Force a fresh access handle on an explicit recovery attempt. Keep the
+      // newest rotated refresh token; never fall back to an older stored token.
+      auth.accessToken = "";
+      auth.accessDeadline = 0;
+      auth.refreshToken = saved;
+      try {
+        const access = await refreshAccessSingleFlight();
+        record("SESSION_RESTORED", { tenantPresent:!!auth.tenant, userPresent:!!auth.user, forced:!!options.forceRefresh });
+        return { ok:true, user:auth.user, tenant:auth.tenant, accessToken:access };
+      } catch (error) {
+        const message = String(error && error.message || error);
+        if (/berakhir|kedaluwarsa|telah digunakan|tidak valid|tidak cocok|silakan login/i.test(message)) {
+          auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
+          clearAuthStorage();
+          record("SESSION_REJECTED", { reason:"refresh_token_invalid" });
+          return { ok:false, authenticated:false, expired:true, message };
+        }
+        record("SESSION_RESTORE_DEFERRED", { reason:"transport_or_server_unavailable", forced:!!options.forceRefresh });
+        throw error;
+      }
+    })().finally(() => { restorePromise = null; });
+    return restorePromise;
   }
   const bridge = {
-    version:"1.4.3",
+    version:"1.4.4",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
@@ -211,7 +235,7 @@
     getTenant() { return auth.tenant; },
     async getAccessToken() { return ensureAccess(); },
     isAuthenticated() { return !!auth.accessToken; },
-    async restoreSession() { return restoreSession(); },
+    async restoreSession(options) { return restoreSession(options); },
     async login(email,password) { const r=await rawPost("pwaLoginV12", [String(email||""),String(password||"")]); return applyAuth(r); },
     async refresh() { return ensureAccess(); },
     async logout() {
