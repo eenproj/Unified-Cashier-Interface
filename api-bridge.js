@@ -227,7 +227,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.4",
+    version:"1.4.5",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
