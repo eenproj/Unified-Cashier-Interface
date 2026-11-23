@@ -4146,7 +4146,18 @@ select,textarea){
 .session-recovery-actions .btn{min-width:125px}
 </style>
 
-<script>window.APOTEK_PWA_MODE=true;</script><script src="./pwa-config.js"></script><script src="./api-bridge.js"></script></head>
+<script>window.APOTEK_PWA_MODE=true;</script><script src="./pwa-config.js?v=1.4.4-4.6"></script><script src="./api-bridge.js?v=1.4.4-4.6"></script>
+<script>
+// Hotfix 4.6: ensure this PWA origin actively registers and checks its worker.
+// updateViaCache:none prevents an HTTP-cached sw.js from hiding a new release.
+(function(){
+ if(!('serviceWorker' in navigator)||location.protocol!=='https:')return;
+ const register=()=>navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'})
+  .then(reg=>reg.update().catch(err=>console.warn('[PWA] Service Worker update check:',err&&err.message||err)))
+  .catch(err=>console.warn('[PWA] Service Worker registration:',err&&err.message||err));
+ if(document.readyState==='complete')register();else window.addEventListener('load',register,{once:true});
+})();
+</script></head>
 <body data-reset-token="">
 <div id="sessionBootstrap" class="session-bootstrap" role="status" aria-live="polite"><div class="session-bootstrap-card"><span class="session-bootstrap-spinner"></span><strong>Memeriksa sesi aplikasi...</strong><span>Mohon tunggu sebentar.</span></div></div>
 <div id="login" class="login hidden">
