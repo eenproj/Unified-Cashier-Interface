@@ -1,6 +1,6 @@
-/* APOTEK PWA API Bridge Client v1.4.2 — Hotfix 4.2
- * Response delivery assurance, frame diagnostics and request correlation.
- * Credentials remain memory-only. Diagnostic records never contain payloads or tokens.
+/* APOTEK PWA API Bridge Client v1.4.8 — Hotfix 4.8
+ * Persistent login across app restarts with server-expiring refresh credentials.
+ * Diagnostic records never contain payloads or tokens.
  */
 (() => {
   "use strict";
@@ -51,14 +51,20 @@
     record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12) });
     return frame;
   }
-  const REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12";
-  const REFRESH_PENDING_KEY = "apotek_pwa_refresh_pending_v12";
+  const REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12_persistent";
+  const REFRESH_PENDING_KEY = "apotek_pwa_refresh_pending_v12_persistent";
+  const LEGACY_REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12";
+  const LEGACY_PENDING_KEY = "apotek_pwa_refresh_pending_v12";
+  // Persistent storage is intentional: the user requested login continuity across
+  // closing/reopening the PWA. Server-side refresh expiry remains authoritative (6h).
+  function credentialStore() { return window.localStorage; }
   function clearPendingRefresh() {
-    try { sessionStorage.removeItem(REFRESH_PENDING_KEY); } catch (_) {}
+    try { credentialStore().removeItem(REFRESH_PENDING_KEY); } catch (_) {}
   }
   function readPendingRefresh() {
     try {
-      const raw = sessionStorage.getItem(REFRESH_PENDING_KEY) || "";
+      let raw = credentialStore().getItem(REFRESH_PENDING_KEY) || "";
+      if (!raw) { raw = sessionStorage.getItem(LEGACY_PENDING_KEY) || ""; if (raw) credentialStore().setItem(REFRESH_PENDING_KEY, raw); }
       if (!raw) return null;
       const value = JSON.parse(raw);
       if (!value || value.version !== 1 || !/^[A-Za-z0-9_-]{16,100}$/.test(String(value.requestId||"")) || typeof value.refreshToken !== "string" || !value.refreshToken) return null;
@@ -68,7 +74,7 @@
   }
   function writePendingRefresh(refreshToken, requestId) {
     try {
-      sessionStorage.setItem(REFRESH_PENDING_KEY, JSON.stringify({version:1,refreshToken:String(refreshToken),requestId:String(requestId),createdAt:Date.now()}));
+      credentialStore().setItem(REFRESH_PENDING_KEY, JSON.stringify({version:1,refreshToken:String(refreshToken),requestId:String(requestId),createdAt:Date.now()}));
       return true;
     } catch (error) {
       record("REFRESH_RECOVERY_MARKER_UNAVAILABLE", {error:String(error && error.message || error).slice(0,120)});
@@ -76,12 +82,15 @@
     }
   }
   function clearAuthStorage() {
-    try { sessionStorage.removeItem(REFRESH_STORAGE_KEY); } catch (_) {}
+    try { credentialStore().removeItem(REFRESH_STORAGE_KEY); } catch (_) {}
+    try { credentialStore().removeItem(LEGACY_REFRESH_STORAGE_KEY); } catch (_) {}
+    try { sessionStorage.removeItem(LEGACY_REFRESH_STORAGE_KEY); } catch (_) {}
+    try { sessionStorage.removeItem(LEGACY_PENDING_KEY); } catch (_) {}
     clearPendingRefresh();
   }
   function persistRefreshToken(token) {
     try {
-      if (token) sessionStorage.setItem(REFRESH_STORAGE_KEY, String(token));
+      if (token) credentialStore().setItem(REFRESH_STORAGE_KEY, String(token));
       else clearAuthStorage();
     } catch (error) {
       record("SESSION_STORAGE_UNAVAILABLE", { error:String(error && error.message || error).slice(0,120) });
@@ -232,7 +241,14 @@
       }
       let saved = auth.refreshToken || "";
       if (!saved) {
-        try { saved = sessionStorage.getItem(REFRESH_STORAGE_KEY) || ""; } catch (_) {}
+        try {
+          saved = credentialStore().getItem(REFRESH_STORAGE_KEY) || "";
+          if (!saved) {
+            // Migrate a still-live Hotfix 4.7 tab token if available.
+            saved = sessionStorage.getItem(LEGACY_REFRESH_STORAGE_KEY) || "";
+            if (saved) credentialStore().setItem(REFRESH_STORAGE_KEY, saved);
+          }
+        } catch (_) {}
       }
       if (!saved) return { ok:false, authenticated:false };
       // Force a fresh access handle on an explicit recovery attempt. Keep the
@@ -259,7 +275,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.7",
+    version:"1.4.8",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
