@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.4.11 — Hotfix 4.14
- * Google HtmlService nested-frame response correlation and ACK hardening.
+/* APOTEK PWA API Bridge Client v1.4.9 — Hotfix 4.12
+ * Duplicate response ACK, strict request/source correlation, and per-request timeout diagnostics.
  * Diagnostic records never contain payloads or tokens.
  */
 (() => {
@@ -25,6 +25,8 @@
     if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.shift();
     lastDiagnostic = item;
     try { console.info("[APOTEK_PWA_BRIDGE]", JSON.stringify(item)); } catch (_) {}
+    // Bounded browser-side persistence survives reloads; diagnostics contain no credentials/payloads.
+    try { const k="apotek_pwa_bridge_diag_v1"; const a=JSON.parse(localStorage.getItem(k)||"[]"); a.push(item); while(a.length>120)a.shift(); localStorage.setItem(k,JSON.stringify(a)); } catch (_) {}
     return item;
   }
   function trustedGoogleResponseOrigin(origin) {
@@ -52,7 +54,8 @@
     frame.tabIndex = -1;
     frame.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
     document.body.appendChild(frame);
-    record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12) });
+    frame.addEventListener("load", () => record("FRAME_LOAD", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), connected:frame.isConnected, visibility:document.visibilityState }));
+    record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), visibility:document.visibilityState });
     return frame;
   }
   const REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12_persistent";
@@ -120,27 +123,21 @@
     const id = String(data.requestId || "");
     const p = pending.get(id);
     if (!p) {
+      record("MESSAGE_NO_PENDING", { requestIdPrefix:id.slice(0,12), origin:event.origin, channel:String(data.channel||"") });
       const done = completed.get(id);
-      if (done && done.expiresAt > Date.now() && done.source === event.source && trustedGoogleResponseOrigin(event.origin)) {
+      if (done && done.expiresAt > Date.now() && done.origin === event.origin && done.source === event.source) {
         acknowledgeResponse(event, id, true);
-        if (done.origin !== event.origin) record("MESSAGE_DUPLICATE_ORIGIN_CHANGED", { requestIdPrefix:id.slice(0,12), previousOrigin:done.origin, origin:event.origin });
         return;
       }
       record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       return;
     }
-    // HtmlService may execute the response script in a nested sandbox frame.
-    // In that case event.source is the nested response window, not the named
-    // form-target iframe's contentWindow. Correlate using the unguessable
-    // 192-bit requestId plus the strict Google response-origin allowlist.
-    if (!trustedGoogleResponseOrigin(event.origin)) {
-      record("MESSAGE_REJECTED_ORIGIN", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+    // Correlate the response to the iframe created for this exact request.
+    if (p.frame && p.frame.contentWindow && event.source !== p.frame.contentWindow) {
+      record("MESSAGE_REJECTED_SOURCE", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       return;
     }
-    const sourceMatchesFrame = !!(p.frame && p.frame.contentWindow && event.source === p.frame.contentWindow);
-    if (!sourceMatchesFrame) {
-      record("MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
-    }
+    record("MESSAGE_CORRELATED", { requestIdPrefix:id.slice(0,12), method:p.method, sourceMatches:true, elapsedMs:Date.now()-p.startedAt });
     acknowledgeResponse(event, id, false);
     clearTimeout(p.timer);
     if (p.retryTimer) clearTimeout(p.retryTimer);
@@ -192,6 +189,7 @@
       let attempts = 0;
       let retryTimer = null;
       const timer = setTimeout(() => {
+        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnected:frame.isConnected, frameName:frame.name, pendingCount:pending.size });
         if (retryTimer) clearTimeout(retryTimer);
         pending.delete(id);
         if (frame.isConnected) frame.remove();
@@ -319,8 +317,9 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.11",
+    version:"1.4.9-diagnostic",
     getDiagnostics() { return diagnostics.slice(); },
+    getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
@@ -347,6 +346,6 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), last:() => bridge.getLastDiagnostic(), clear:() => bridge.clearDiagnostics() });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
