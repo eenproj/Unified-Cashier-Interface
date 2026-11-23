@@ -51,12 +51,37 @@
     record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12) });
     return frame;
   }
+  const REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12";
+  const REFRESH_PENDING_KEY = "apotek_pwa_refresh_pending_v12";
+  function clearPendingRefresh() {
+    try { sessionStorage.removeItem(REFRESH_PENDING_KEY); } catch (_) {}
+  }
+  function readPendingRefresh() {
+    try {
+      const raw = sessionStorage.getItem(REFRESH_PENDING_KEY) || "";
+      if (!raw) return null;
+      const value = JSON.parse(raw);
+      if (!value || value.version !== 1 || !/^[A-Za-z0-9_-]{16,100}$/.test(String(value.requestId||"")) || typeof value.refreshToken !== "string" || !value.refreshToken) return null;
+      if (Date.now() - Number(value.createdAt||0) > 10*60*1000) return null;
+      return value;
+    } catch (_) { return null; }
+  }
+  function writePendingRefresh(refreshToken, requestId) {
+    try {
+      sessionStorage.setItem(REFRESH_PENDING_KEY, JSON.stringify({version:1,refreshToken:String(refreshToken),requestId:String(requestId),createdAt:Date.now()}));
+      return true;
+    } catch (error) {
+      record("REFRESH_RECOVERY_MARKER_UNAVAILABLE", {error:String(error && error.message || error).slice(0,120)});
+      return false;
+    }
+  }
   function clearAuthStorage() {
-    try { sessionStorage.removeItem("apotek_pwa_refresh_v12"); } catch (_) {}
+    try { sessionStorage.removeItem(REFRESH_STORAGE_KEY); } catch (_) {}
+    clearPendingRefresh();
   }
   function persistRefreshToken(token) {
     try {
-      if (token) sessionStorage.setItem("apotek_pwa_refresh_v12", String(token));
+      if (token) sessionStorage.setItem(REFRESH_STORAGE_KEY, String(token));
       else clearAuthStorage();
     } catch (error) {
       record("SESSION_STORAGE_UNAVAILABLE", { error:String(error && error.message || error).slice(0,120) });
@@ -105,10 +130,10 @@
     settleMessage(event, data);
   });
 
-  function rawPost(method, args) {
+  function rawPost(method, args, requestIdOverride) {
     if (!validEndpoint(endpoint)) return Promise.reject(new Error("URL Apps Script belum dikonfigurasi."));
     if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
-    const id = makeId();
+    const id = requestIdOverride || makeId();
     const frame = createFrame(id);
     const retryableLifecycle = ["pwaLoginV12", "pwaRefreshV12", "pwaLogoutV12"].includes(String(method));
     return new Promise((resolve, reject) => {
@@ -172,6 +197,8 @@
     if (!r || r.ok !== true || !r.accessToken || !r.refreshToken) throw new Error(r && r.message || "Respons autentikasi tidak valid.");
     auth = { accessToken:r.accessToken, refreshToken:r.refreshToken, accessDeadline:Date.now()+Math.max(30,Number(r.accessExpiresIn)||900)*1000, user:r.user||null, tenant:r.tenant||null };
     persistRefreshToken(auth.refreshToken);
+    // Persist the replacement token before removing the crash-recovery marker.
+    clearPendingRefresh();
     return { ok:true, user:auth.user, tenant:auth.tenant, profileComplete:r.profileComplete, profileMissing:r.profileMissing, expiresIn:r.accessExpiresIn*1000 };
   }
   async function refreshAccessSingleFlight() {
@@ -179,8 +206,13 @@
     if (!auth.refreshToken) throw new Error("Sesi tidak tersedia. Silakan login.");
     if (refreshPromise) return refreshPromise;
     const token = auth.refreshToken;
+    const existingPending = readPendingRefresh();
+    const requestId = existingPending && existingPending.refreshToken === token ? existingPending.requestId : makeId();
+    // Write-ahead marker: if this tab reloads while GAS rotates the token,
+    // the next page load repeats the exact same lifecycle request ID + payload.
+    writePendingRefresh(token, requestId);
     refreshPromise = (async () => {
-      const r = await rawPost("pwaRefreshV12", [token]);
+      const r = await rawPost("pwaRefreshV12", [token], requestId);
       applyAuth(r);
       record("ACCESS_TOKEN_REFRESHED", { accessExpiresIn:Number(r.accessExpiresIn)||0 });
       return auth.accessToken;
@@ -200,7 +232,7 @@
       }
       let saved = auth.refreshToken || "";
       if (!saved) {
-        try { saved = sessionStorage.getItem("apotek_pwa_refresh_v12") || ""; } catch (_) {}
+        try { saved = sessionStorage.getItem(REFRESH_STORAGE_KEY) || ""; } catch (_) {}
       }
       if (!saved) return { ok:false, authenticated:false };
       // Force a fresh access handle on an explicit recovery attempt. Keep the
@@ -227,7 +259,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.5",
+    version:"1.4.7",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
