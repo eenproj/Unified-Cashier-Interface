@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.4.8 — Hotfix 4.8
- * Persistent login across app restarts with server-expiring refresh credentials.
+/* APOTEK PWA API Bridge Client v1.4.9 — Hotfix 4.12
+ * Duplicate response ACK, strict request/source correlation, and per-request timeout diagnostics.
  * Diagnostic records never contain payloads or tokens.
  */
 (() => {
@@ -7,7 +7,11 @@
   const cfg = window.APOTEK_PWA_CONFIG || {};
   const endpoint = String(cfg.gasWebAppUrl || "").trim();
   const pending = new Map();
-  let iframe = null;
+  // Completed requests remain briefly addressable so duplicate gateway deliveries
+  // can be ACKed instead of being misclassified as unknown requests.
+  const completed = new Map();
+  const COMPLETED_ACK_TTL_MS = 7000;
+
   let lastDiagnostic = null;
   let refreshPromise = null;
   let restorePromise = null;
@@ -101,20 +105,46 @@
     crypto.getRandomValues(b);
     return Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
   }
+  function acknowledgeResponse(event, id, duplicate) {
+    try {
+      if (!event.source || typeof event.source.postMessage !== "function") throw new Error("Response source unavailable");
+      event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id }, event.origin);
+      record(duplicate ? "MESSAGE_DUPLICATE_ACKED" : "MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      return true;
+    } catch (ackError) {
+      record("MESSAGE_ACK_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160) });
+      return false;
+    }
+  }
   function settleMessage(event, data) {
     const id = String(data.requestId || "");
     const p = pending.get(id);
-    if (!p) { record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin }); return; }
-    // Acknowledge the exact response frame. Backend retries stop after this ACK.
-    try {
-      event.source && event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id }, event.origin);
-      record("MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin });
-    } catch (ackError) {
-      record("MESSAGE_ACK_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160) });
+    if (!p) {
+      const done = completed.get(id);
+      if (done && done.expiresAt > Date.now() && done.origin === event.origin && done.source === event.source) {
+        acknowledgeResponse(event, id, true);
+        return;
+      }
+      record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      return;
     }
+    // Correlate the response to the iframe created for this exact request.
+    if (p.frame && p.frame.contentWindow && event.source !== p.frame.contentWindow) {
+      record("MESSAGE_REJECTED_SOURCE", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      return;
+    }
+    acknowledgeResponse(event, id, false);
     clearTimeout(p.timer);
+    if (p.retryTimer) clearTimeout(p.retryTimer);
     pending.delete(id);
-    if (p.frame && p.frame.isConnected) p.frame.remove();
+    // Keep the response frame alive for the backend's bounded retry window.
+    // Duplicate deliveries are ACKed above; this avoids noisy UNKNOWN_REQUEST logs.
+    const done = { origin:event.origin, source:event.source, frame:p.frame, expiresAt:Date.now()+COMPLETED_ACK_TTL_MS };
+    completed.set(id, done);
+    setTimeout(() => {
+      if (completed.get(id) === done) completed.delete(id);
+      if (p.frame && p.frame.isConnected) p.frame.remove();
+    }, COMPLETED_ACK_TTL_MS);
     if (!data.result || data.result.ok !== true) {
       record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       p.reject(new Error(String(data.result && data.result.message || "Permintaan API gagal.")));
@@ -132,6 +162,10 @@
       record("MESSAGE_REJECTED_ORIGIN", { requestIdPrefix:id.slice(0,12), origin:String(event.origin || "").slice(0,180) });
       return;
     }
+    const active = pending.get(id);
+    const done = completed.get(id);
+    if (active) active.lastMessageStage = "MESSAGE_RECEIVED";
+    else if (done && done.expiresAt > Date.now()) done.lastMessageStage = "MESSAGE_DUPLICATE_RECEIVED";
     if (!/^[A-Za-z0-9_-]{16,100}$/.test(id)) {
       record("MESSAGE_REJECTED_REQUEST_ID", { origin:event.origin });
       return;
@@ -153,10 +187,10 @@
         if (retryTimer) clearTimeout(retryTimer);
         pending.delete(id);
         if (frame.isConnected) frame.remove();
-        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:Date.now()-startedAt, lastMessageStage:lastDiagnostic && lastDiagnostic.stage || null });
+        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:Date.now()-startedAt, lastMessageStage:p.lastMessageStage || null });
         reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));
       }, 45000);
-      const p = { resolve, reject, timer, startedAt, method:String(method), frame };
+      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null };
       pending.set(id, p);
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
@@ -182,6 +216,7 @@
           form.remove();
           if (attempts < (retryableLifecycle ? 3 : 1)) {
             retryTimer = setTimeout(() => submitAttempt(true), 1200 * attempts);
+          p.retryTimer = retryTimer;
           } else {
             clearTimeout(timer); pending.delete(id); if (frame.isConnected) frame.remove();
             record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
@@ -198,6 +233,7 @@
         retryTimer = setTimeout(() => {
           if (pending.has(id) && attempts < 2) submitAttempt(true);
         }, 9000);
+        p.retryTimer = retryTimer;
       }
     });
   }
@@ -275,7 +311,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.8",
+    version:"1.4.9",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
