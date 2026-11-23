@@ -4353,6 +4353,8 @@ select,textarea){
 <script>
 const APOTEK_PWA_MODE=window.APOTEK_PWA_MODE===true;
 let TOKEN='', USER=null, DATA=null, CART=[], APOTEK_PROFILE=null;
+// Fast dashboard bootstrap: show dashboard payload first, hydrate operational master data in background.
+let APP_FULL_DATA_READY=false, APP_FULL_DATA_PROMISE=null;
 function hasPwaSession_(){return !!(APOTEK_PWA_MODE&&window.ApotekApiBridge&&window.ApotekApiBridge.isAuthenticated());}
 function setPwaSessionSentinel_(){TOKEN=hasPwaSession_()?'PWA_SESSION':'';}
 let ACTIVE_TENANT_CODE=String(localStorage.getItem('apotek_tenant_code')||'DEFAULT').trim().toUpperCase();
@@ -4823,19 +4825,29 @@ async function startApp(){
   applyAdminMenuVisibility();
   startSalesNotificationListener();
   $('title').textContent=OFFLINE_MODE?'Kasir (Offline)':'Dashboard';
-  $('view').innerHTML='<div class="card"><h3>Memuat aplikasi...</h3><div class="muted">Menyiapkan data master.</div></div>';
+  $('view').innerHTML='<div class="card"><h3>Menyiapkan Dashboard...</h3><div class="muted">Memuat ringkasan utama terlebih dahulu.</div></div>';
   try{
     if(!OFFLINE_MODE){
       const brandingTask=call('getApotekBranding',TOKEN).then(profile=>{APOTEK_PROFILE=profile;updateApotekBranding();}).catch(e=>console.warn('Identitas apotek tidak dapat dimuat',e));
-      await refreshData();void loadNotifications();void refreshSidebarBadges();page('dashboard');void brandingTask;
+      // Fast path: request the lightweight shell and dashboard summary in parallel.
+      // The full product/master bootstrap no longer blocks the first dashboard paint.
+      const [shell,dashboard]=await Promise.all([call('bootstrapShell',TOKEN),call('getDashboard',TOKEN)]);
+      if(!TOKEN)throw new Error('Sesi berubah saat menyiapkan Dashboard.');
+      DATA=Object.assign({},shell||{},{dashboard:dashboard||{cards:{},topProducts:[],topCustomers:[]}});
+      DATA.master=DATA.master||{kategori:[],satuan:[],rak:[],supplier:[],produk:[]};
+      DATA.user=USER||DATA.user;APP_FULL_DATA_READY=false;
+      $('sessionBootstrap')?.classList.add('hidden');
+      page('dashboard');void loadNotifications();void refreshSidebarBadges();void brandingTask;
+      // Hydrate full operational data without delaying dashboard display.
+      APP_FULL_DATA_PROMISE=refreshData().then(()=>{APP_FULL_DATA_READY=true;return true;}).catch(error=>{APP_FULL_DATA_READY=false;console.warn('Pemuatan data operasional lanjutan gagal:',error);return false;}).finally(()=>{APP_FULL_DATA_PROMISE=null;});
       void syncOfflineSales(false);
     }else{
       if(!DATA)restoreOfflineMaster();
-      updateOfflineStatus();page('kasir');
+      APP_FULL_DATA_READY=true;updateOfflineStatus();page('kasir');
     }
   }catch(e){
     restoreOfflineMaster();OFFLINE_MODE=false;
-    $('view').innerHTML='<div class="card"><div class="error">Aplikasi tidak dapat memverifikasi lisensi atau memuat data dari server: '+esc(e.message||e)+'. Draft lokal tetap disimpan. Hubungkan internet lalu login kembali.</div><br><button class="btn primary" onclick="logout()">Kembali ke Login</button></div>';
+    $('view').innerHTML='<div class="card"><div class="error">Aplikasi tidak dapat memverifikasi lisensi atau memuat Dashboard: '+esc(e.message||e)+'. Draft lokal tetap disimpan. Periksa koneksi lalu coba kembali.</div><br><button class="btn primary" onclick="init(true)">Coba Lagi</button></div>';
   }
 }
 
@@ -5297,6 +5309,12 @@ function canShowTransactionAction(feature){const role=String(USER?.role||'').toU
 function hasClientFeatureAccess(feature){const role=String(USER?.role||'').toUpperCase();return role==='ADMIN'||(FEATURE_ACCESS_READY&&(FEATURE_ACCESS[role]||[]).includes(feature));}
 function page(p){
   if(document.getElementById('app')?.classList.contains('product-scanner-locked'))return;
+  // Dashboard is available immediately; operational menus wait for the background
+  // master/product bootstrap so they never render against incomplete DATA.
+  if(p!=='dashboard'&&!APP_FULL_DATA_READY){
+    if(APP_FULL_DATA_PROMISE){$('title').textContent='Menyiapkan '+p;$('view').innerHTML='<div class="card"><h3>Menyiapkan data operasional...</h3><div class="muted">Menu akan dibuka setelah data master selesai dimuat.</div></div>';return APP_FULL_DATA_PROMISE.then(ok=>{if(ok&&TOKEN)page(p);else if(TOKEN){$('view').innerHTML='<div class="card"><div class="error">Data operasional belum berhasil dimuat. Periksa koneksi lalu coba buka menu kembali.</div></div>';}});}
+    return;
+  }
   if(!TOKEN||!USER){showLoginScreen();return;}
   const roleNow=String(USER?.role||'').toUpperCase();
   const ownerAdminExempt=roleNow==='ADMIN' && !!USER?.isLicenseOwner;
