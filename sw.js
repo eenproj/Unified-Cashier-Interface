@@ -1,5 +1,5 @@
-/* APOTEK PWA SW v1.4.8 — mutable shell assets are network-first; never cache API/auth responses. */
-const CACHE='apotek-pwa-shell-v1.4.8-4.8';
+/* APOTEK PWA SW v1.4.9 — mutable shell assets are network-first; never cache API/auth responses. */
+const CACHE='apotek-pwa-shell-v1.4.9-4.8';
 const ASSETS=['./','./index.html','./app.html','./offline.html','./manifest.webmanifest','./pwa-config.js','./api-bridge.js','./diagnostics.html','./production-check.html'];
 const MUTABLE=new Set(['app.html','index.html','pwa-config.js','api-bridge.js']);
 self.addEventListener('install',event=>event.waitUntil((async()=>{
