@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.4.9 — Hotfix 4.12
- * Duplicate response ACK, strict request/source correlation, and per-request timeout diagnostics.
+/* APOTEK PWA API Bridge Client v1.4.11 — Hotfix 4.14
+ * Google HtmlService nested-frame response correlation and ACK hardening.
  * Diagnostic records never contain payloads or tokens.
  */
 (() => {
@@ -121,17 +121,25 @@
     const p = pending.get(id);
     if (!p) {
       const done = completed.get(id);
-      if (done && done.expiresAt > Date.now() && done.origin === event.origin && done.source === event.source) {
+      if (done && done.expiresAt > Date.now() && done.source === event.source && trustedGoogleResponseOrigin(event.origin)) {
         acknowledgeResponse(event, id, true);
+        if (done.origin !== event.origin) record("MESSAGE_DUPLICATE_ORIGIN_CHANGED", { requestIdPrefix:id.slice(0,12), previousOrigin:done.origin, origin:event.origin });
         return;
       }
       record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       return;
     }
-    // Correlate the response to the iframe created for this exact request.
-    if (p.frame && p.frame.contentWindow && event.source !== p.frame.contentWindow) {
-      record("MESSAGE_REJECTED_SOURCE", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+    // HtmlService may execute the response script in a nested sandbox frame.
+    // In that case event.source is the nested response window, not the named
+    // form-target iframe's contentWindow. Correlate using the unguessable
+    // 192-bit requestId plus the strict Google response-origin allowlist.
+    if (!trustedGoogleResponseOrigin(event.origin)) {
+      record("MESSAGE_REJECTED_ORIGIN", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       return;
+    }
+    const sourceMatchesFrame = !!(p.frame && p.frame.contentWindow && event.source === p.frame.contentWindow);
+    if (!sourceMatchesFrame) {
+      record("MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
     }
     acknowledgeResponse(event, id, false);
     clearTimeout(p.timer);
@@ -311,7 +319,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.9",
+    version:"1.4.11",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
