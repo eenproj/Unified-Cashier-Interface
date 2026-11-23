@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.4.9 — Hotfix 4.12
- * Duplicate response ACK, strict request/source correlation, and per-request timeout diagnostics.
+/* APOTEK PWA API Bridge Client v1.4.10 — Hotfix 4.13
+ * Source-bound duplicate ACK diagnostics and per-request timeout diagnostics.
  * Diagnostic records never contain payloads or tokens.
  */
 (() => {
@@ -121,11 +121,22 @@
     const p = pending.get(id);
     if (!p) {
       const done = completed.get(id);
-      if (done && done.expiresAt > Date.now() && done.origin === event.origin && done.source === event.source) {
-        acknowledgeResponse(event, id, true);
+      if (done && done.expiresAt > Date.now()) {
+        const sameFrame = !!(done.frame && done.frame.contentWindow && event.source === done.frame.contentWindow);
+        const sameSource = event.source === done.source;
+        const originChanged = done.origin !== event.origin;
+        // The iframe WindowProxy remains stable across Google response-document
+        // navigations. Trust the exact request iframe + a Google response origin;
+        // do not require the redirect origin string to remain identical.
+        if (sameFrame && sameSource && trustedGoogleResponseOrigin(event.origin)) {
+          acknowledgeResponse(event, id, true);
+          if (originChanged) record("MESSAGE_DUPLICATE_ORIGIN_CHANGED", { requestIdPrefix:id.slice(0,12), previousOrigin:done.origin, origin:event.origin });
+          return;
+        }
+        record("MESSAGE_DUPLICATE_REJECTED", { requestIdPrefix:id.slice(0,12), origin:event.origin, sameFrame:sameFrame, sameSource:sameSource, sameOrigin:done.origin===event.origin });
         return;
       }
-      record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin, completedKnown:!!done, pendingCount:pending.size, completedCount:completed.size });
       return;
     }
     // Correlate the response to the iframe created for this exact request.
@@ -311,7 +322,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.9",
+    version:"1.4.10",
     getDiagnostics() { return diagnostics.slice(); },
     getLastDiagnostic() { return lastDiagnostic; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
