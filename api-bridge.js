@@ -1,4 +1,4 @@
-/* APOTEK PWA API Bridge Client v1.5.0 — Gateway Idempotency & Response Recovery.
+/* APOTEK PWA API Bridge Client v1.5.1 — Retry Timing Correction & Session Recovery.
  * Preserves Hotfix 4.14 nested-frame correlation; retries reuse the same requestId.
  * Diagnostic records never contain payloads or tokens.
  */
@@ -248,10 +248,13 @@
           return;
         }
         setTimeout(() => form.remove(), 1000);
-        if (safeRetryEnabled && attempts < 4) {
-          const delay = attempts === 1 ? 9000 : 12000;
+        if (safeRetryEnabled && attempts < 2) {
+          // Allow normal mobile HtmlService delivery to complete before retrying.
+          // A retry reuses the exact requestId and arguments; backend idempotency
+          // or lifecycle replay remains the final duplicate-execution safeguard.
+          const delay = 25000;
           if (p.retryTimer) clearTimeout(p.retryTimer);
-          retryTimer = setTimeout(() => { if (pending.has(id) && attempts < 4) submitAttempt(true); }, delay);
+          retryTimer = setTimeout(() => { if (pending.has(id) && attempts < 2) submitAttempt(true); }, delay);
           p.retryTimer = retryTimer;
         }
       }
@@ -333,7 +336,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.5.0-idempotency",
+    version:"1.5.1-idempotency-recovery",
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
