@@ -4609,14 +4609,39 @@ async function init(isRetry=false){
  restoreBarcodeScannerSession_();
  showSessionBootstrap(isRetry?'Menghubungkan kembali ke server...':'Memeriksa sesi aplikasi...');
  if(APOTEK_PWA_MODE){
-  setPwaSessionSentinel_();
   const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=false;
-  if(TOKEN){
-   try{const r=await call('validateSession',TOKEN);if(r&&r.ok){USER=r.user;ACTIVE_TENANT_CODE=String(USER?.tenantCode||'DEFAULT').trim().toUpperCase();localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);OFFLINE_MODE=false;$('sessionBootstrap')?.classList.add('hidden');await startApp();recoverBarcodeSaveState_();consumeScannerReturnPage_();return true;}}
-   catch(e){console.warn('[PWA] Validasi sesi gagal:',e&&e.message||e);}
-   await window.ApotekApiBridge.logout().catch(()=>{});TOKEN='';showLoginScreen('Sesi tidak tersedia atau telah berakhir. Silakan masuk kembali.');return false;
+  // Restore the persisted rotating refresh credential before deciding that the
+  // user is unauthenticated. A page reload creates a new JS context, so the
+  // in-memory access token is expected to be empty at this point.
+  let restored=null;
+  try{
+   restored=await window.ApotekApiBridge.restoreSession();
+  }catch(e){
+   console.warn('[PWA] Pemulihan sesi tertunda:',e&&e.message||e);
+   showSessionBootstrap('',true);
+   return false;
   }
-  showLoginScreen();return false;
+  if(!restored||restored.ok!==true){
+   TOKEN='';
+   showLoginScreen(restored?.message||'Silakan masuk untuk melanjutkan.');
+   return false;
+  }
+  setPwaSessionSentinel_();
+  if(!TOKEN){
+   showSessionBootstrap('',true);
+   return false;
+  }
+  USER=restored.user||window.ApotekApiBridge.getUser()||null;
+  ACTIVE_TENANT_CODE=String(restored.tenant?.code||USER?.tenantCode||localStorage.getItem('apotek_tenant_code')||'DEFAULT').trim().toUpperCase();
+  localStorage.setItem('apotek_tenant_code',ACTIVE_TENANT_CODE);
+  OFFLINE_MODE=false;
+  $('sessionBootstrap')?.classList.add('hidden');
+  // pwaRefreshV12 validates the underlying server session and tenant context;
+  // avoid an additional validateSession round trip after successful restoration.
+  await startApp();
+  recoverBarcodeSaveState_();
+  consumeScannerReturnPage_();
+  return true;
  }
  const savedToken=localStorage.getItem('apotek_token')||sessionStorage.getItem('apotek_token')||'';
  const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=!!localStorage.getItem('apotek_token');
