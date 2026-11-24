@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.4.11 — Hotfix 4.14
- * Google HtmlService nested-frame response correlation and ACK hardening.
+/* APOTEK PWA API Bridge Client v1.5.0 — Gateway Idempotency & Response Recovery.
+ * Preserves Hotfix 4.14 nested-frame correlation; retries reuse the same requestId.
  * Diagnostic records never contain payloads or tokens.
  */
 (() => {
@@ -16,7 +16,7 @@
   let refreshPromise = null;
   let restorePromise = null;
   const diagnostics = [];
-  const MAX_DIAGNOSTICS = 80;
+  const MAX_DIAGNOSTICS = 120;
   let auth = { accessToken:"", refreshToken:"", accessDeadline:0, user:null, tenant:null };
 
   function record(stage, detail) {
@@ -25,7 +25,7 @@
     if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.shift();
     lastDiagnostic = item;
     try { console.info("[APOTEK_PWA_BRIDGE]", JSON.stringify(item)); } catch (_) {}
-    // Bounded browser persistence; keep credentials and request payloads out of diagnostics.
+    // Bounded diagnostics survive reloads and contain no credentials or request payloads.
     try { const k="apotek_pwa_bridge_diag_v1"; const a=JSON.parse(localStorage.getItem(k)||"[]"); a.push(item); while(a.length>120)a.shift(); localStorage.setItem(k,JSON.stringify(a)); } catch (_) {}
     return item;
   }
@@ -123,7 +123,6 @@
     const id = String(data.requestId || "");
     const p = pending.get(id);
     if (!p) {
-      record("MESSAGE_NO_PENDING", { requestIdPrefix:id.slice(0,12), origin:event.origin, channel:String(data.channel||"") });
       const done = completed.get(id);
       if (done && done.expiresAt > Date.now() && done.source === event.source && trustedGoogleResponseOrigin(event.origin)) {
         acknowledgeResponse(event, id, true);
@@ -145,7 +144,15 @@
     if (!sourceMatchesFrame) {
       record("MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
     }
-    record("MESSAGE_CORRELATED", { requestIdPrefix:id.slice(0,12), method:p.method, sourceMatches:sourceMatchesFrame, elapsedMs:Date.now()-p.startedAt });
+    if (data.result && data.result.code === "GATEWAY_REQUEST_IN_PROGRESS") {
+      acknowledgeResponse(event, id, false);
+      record("MESSAGE_REQUEST_IN_PROGRESS", { requestIdPrefix:id.slice(0,12), method:p.method, retryAfterMs:Number(data.result.retryAfterMs)||2000, elapsedMs:Date.now()-p.startedAt });
+      if (p.retryTimer) clearTimeout(p.retryTimer);
+      const delay = Math.max(1000, Math.min(5000, Number(data.result.retryAfterMs)||2000));
+      p.retryTimer = setTimeout(() => { if (pending.has(id) && p.submitAttempt && p.attempts < 7) p.submitAttempt(true); }, delay);
+      retryTimer = p.retryTimer;
+      return;
+    }
     acknowledgeResponse(event, id, false);
     clearTimeout(p.timer);
     if (p.retryTimer) clearTimeout(p.retryTimer);
@@ -159,7 +166,7 @@
       if (p.frame && p.frame.isConnected) p.frame.remove();
     }, COMPLETED_ACK_TTL_MS);
     if (!data.result || data.result.ok !== true) {
-      record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:String(data.result && data.result.code || "").slice(0,80), origin:event.origin });
       p.reject(new Error(String(data.result && data.result.message || "Permintaan API gagal.")));
       return;
     }
@@ -191,25 +198,27 @@
     if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
     const id = requestIdOverride || makeId();
     const frame = createFrame(id);
-    const retryableLifecycle = ["pwaLoginV12", "pwaRefreshV12", "pwaLogoutV12"].includes(String(method));
+    const safeRetryEnabled = true; // Backend requestId registry prevents duplicate mutation execution.
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
       let attempts = 0;
       let retryTimer = null;
       const timer = setTimeout(() => {
-        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnected:frame.isConnected, frameName:frame.name, pendingCount:pending.size });
         if (retryTimer) clearTimeout(retryTimer);
+        if (p.retryTimer) clearTimeout(p.retryTimer);
         pending.delete(id);
         if (frame.isConnected) frame.remove();
+        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnected:frame.isConnected, pendingCount:pending.size });
         record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:Date.now()-startedAt, lastMessageStage:p.lastMessageStage || null });
         reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));
-      }, 45000);
-      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null };
+      }, 60000);
+      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null };
       pending.set(id, p);
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
         attempts++;
-        record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host });
+        p.attempts=attempts;
+        record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host, visibility:document.visibilityState });
         const form = document.createElement("form");
         form.method = "POST";
         form.action = endpoint;
@@ -228,9 +237,9 @@
           record("REQUEST_SUBMIT_CALLED", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts });
         } catch (error) {
           form.remove();
-          if (attempts < (retryableLifecycle ? 3 : 1)) {
-            retryTimer = setTimeout(() => submitAttempt(true), 1200 * attempts);
-          p.retryTimer = retryTimer;
+          if (safeRetryEnabled && attempts < 4) {
+            retryTimer = setTimeout(() => { if (pending.has(id)) submitAttempt(true); }, 1200 * attempts);
+            p.retryTimer = retryTimer;
           } else {
             clearTimeout(timer); pending.delete(id); if (frame.isConnected) frame.remove();
             record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
@@ -239,16 +248,15 @@
           return;
         }
         setTimeout(() => form.remove(), 1000);
+        if (safeRetryEnabled && attempts < 4) {
+          const delay = attempts === 1 ? 9000 : 12000;
+          if (p.retryTimer) clearTimeout(p.retryTimer);
+          retryTimer = setTimeout(() => { if (pending.has(id) && attempts < 4) submitAttempt(true); }, delay);
+          p.retryTimer = retryTimer;
+        }
       }
+      p.submitAttempt = submitAttempt;
       submitAttempt(false);
-      // Retry only lifecycle operations. Server-side requestId replay protection
-      // makes a repeated login/refresh/logout return the original result safely.
-      if (retryableLifecycle) {
-        retryTimer = setTimeout(() => {
-          if (pending.has(id) && attempts < 2) submitAttempt(true);
-        }, 9000);
-        p.retryTimer = retryTimer;
-      }
     });
   }
 
@@ -325,7 +333,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.4.11-diagnostic",
+    version:"1.5.0-idempotency",
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
