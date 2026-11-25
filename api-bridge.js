@@ -1,6 +1,6 @@
-/* APOTEK PWA API Bridge Client v1.5.2 — Scanner Lookup Latency & Failure Classification.
- * Preserves Hotfix 4.14 nested-frame correlation and requestId safeguards.
- * Fast barcode lookup is read-only: no automatic retry and a bounded 15s timeout.
+/* APOTEK PWA API Bridge Client v1.7.0 — Resilient Gateway Recovery V2.
+ * Corrected unified timeout, bounded late-response ACK lifecycle, and request isolation.
+ * Fast barcode lookup remains read-only and is never automatically retried.
  * Diagnostics contain no credentials, request payloads, or barcode values.
  */
 (() => {
@@ -14,9 +14,12 @@
   const lateRequests = new Map();
   const COMPLETED_ACK_TTL_MS = 12000;
   const MAX_PENDING_REQUESTS = 8;
+  const MAX_LATE_RESPONSE_WATCHES = 8;
   const LOOKUP_SOFT_TIMEOUT_MS = 12000;
   const LOOKUP_HARD_TIMEOUT_MS = 30000;
   const LOOKUP_FRAME_GRACE_MS = 12000;
+  const LOOKUP_SOFT_WARNING_MS = LOOKUP_SOFT_TIMEOUT_MS;
+  const GENERAL_REQUEST_TIMEOUT_MS = 60000;
 
   let lastDiagnostic = null;
   let refreshPromise = null;
@@ -137,9 +140,13 @@
       }
       const late = lateRequests.get(id);
       if (late && late.expiresAt > Date.now() && trustedGoogleResponseOrigin(event.origin)) {
+        // A timed-out operation is terminal for the UI. ACK only to stop gateway
+        // redelivery; never resolve the original Promise or apply its payload.
         acknowledgeResponse(event, id, true);
         lateRequests.delete(id);
-        record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,frameConnected:!!(late.frame&&late.frame.isConnected)});
+        clearTimeout(late.cleanupTimer);
+        if (late.frame && late.frame.isConnected) late.frame.remove();
+        record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,frameConnectedBeforeCleanup:!!(late.frame&&late.frame.isConnected),payloadApplied:false});
         return;
       }
       record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
@@ -215,11 +222,19 @@
   function rawPost(method, args, requestIdOverride) {
     if (!validEndpoint(endpoint)) return Promise.reject(new Error("URL Apps Script belum dikonfigurasi."));
     if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
-    const id = requestIdOverride || makeId();
-    const frame = createFrame(id);
     const isFastBarcodeLookup=String(method)==="getBarcodeProductFast";
+    // Bound active work before creating an iframe or allocating a timer.
+    if (pending.size >= MAX_PENDING_REQUESTS) {
+      const capacityError = new Error("API sedang menangani terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.");
+      capacityError.code = "GATEWAY_CAPACITY_LIMIT";
+      record("REQUEST_REJECTED_CAPACITY", {method:String(method).slice(0,60),pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS});
+      return Promise.reject(capacityError);
+    }
+    const id = requestIdOverride || makeId();
+    if (!/^[A-Za-z0-9_-]{16,100}$/.test(String(id))) return Promise.reject(new Error("Request ID tidak valid."));
+    const frame = createFrame(id);
     const safeRetryEnabled = !isFastBarcodeLookup; // Lookup is read-only; avoid queue amplification.
-    const timeoutMs=isFastBarcodeLookup?15000:60000;
+    const timeoutMs=isFastBarcodeLookup?LOOKUP_HARD_TIMEOUT_MS:GENERAL_REQUEST_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
       let attempts = 0;
@@ -227,16 +242,36 @@
       const timer = setTimeout(() => {
         if (retryTimer) clearTimeout(retryTimer);
         if (p.retryTimer) clearTimeout(p.retryTimer);
+        const frameConnectedBeforeCleanup = !!frame.isConnected;
         pending.delete(id);
-        if (frame.isConnected) frame.remove();
-        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnected:frame.isConnected, pendingCount:pending.size });
         const elapsedMs=Date.now()-startedAt;
         const trace={requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:elapsedMs,attempts:attempts,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:null,lastMessageStage:p.lastMessageStage||null,visibility:document.visibilityState};
-        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:elapsedMs, timeoutMs:timeoutMs, lastMessageStage:p.lastMessageStage || null });
-        const timeoutError=new Error(isFastBarcodeLookup?"Pencarian barcode melewati batas waktu tunggu. Status produk belum dapat dipastikan.":"Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi.");
-        timeoutError.code="GATEWAY_TIMEOUT";timeoutError.bridgeTrace=trace;reject(timeoutError);
+        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, pendingCount:pending.size });
+        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:elapsedMs, timeoutMs:timeoutMs, lastMessageStage:p.lastMessageStage || null, lateGraceMs:LOOKUP_FRAME_GRACE_MS });
+        // Keep the named response frame alive briefly so a delayed HtmlService
+        // response can be ACKed. Its data is deliberately discarded after timeout.
+        // Keep the late-watch registry bounded even during repeated outages.
+        if (lateRequests.size >= MAX_LATE_RESPONSE_WATCHES) {
+          const oldestId = lateRequests.keys().next().value;
+          const oldest = lateRequests.get(oldestId);
+          if (oldest) { clearTimeout(oldest.cleanupTimer); if (oldest.frame && oldest.frame.isConnected) oldest.frame.remove(); }
+          lateRequests.delete(oldestId);
+          record("LATE_RESPONSE_WATCH_EVICTED", {requestIdPrefix:String(oldestId).slice(0,12),maxLateWatches:MAX_LATE_RESPONSE_WATCHES});
+        }
+        const late = {method:String(method),startedAt,frame,expiresAt:Date.now()+LOOKUP_FRAME_GRACE_MS,cleanupTimer:null};
+        late.cleanupTimer = setTimeout(() => {
+          if (lateRequests.get(id) === late) lateRequests.delete(id);
+          if (frame.isConnected) frame.remove();
+          record("LATE_RESPONSE_GRACE_EXPIRED", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),graceMs:LOOKUP_FRAME_GRACE_MS});
+        }, LOOKUP_FRAME_GRACE_MS);
+        lateRequests.set(id, late);
+        const timeoutError=new Error(isFastBarcodeLookup?"Pencarian barcode melewati batas waktu 30 detik. Status produk belum dapat dipastikan.":"Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi.");
+        timeoutError.code=isFastBarcodeLookup?"LOOKUP_TIMEOUT":"GATEWAY_TIMEOUT";timeoutError.bridgeTrace=trace;reject(timeoutError);
       }, timeoutMs);
-      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
+      const softTimer = isFastBarcodeLookup ? setTimeout(() => {
+        if (pending.has(id)) record("REQUEST_SLOW_WARNING", {requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:Date.now()-startedAt,softTimeoutMs:LOOKUP_SOFT_WARNING_MS,finalTimeoutMs:timeoutMs});
+      }, LOOKUP_SOFT_WARNING_MS) : null;
+      const p = { resolve, reject, timer, softTimer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
       pending.set(id, p);
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
@@ -266,7 +301,7 @@
             retryTimer = setTimeout(() => { if (pending.has(id)) submitAttempt(true); }, 1200 * attempts);
             p.retryTimer = retryTimer;
           } else {
-            clearTimeout(timer); pending.delete(id); if (frame.isConnected) frame.remove();
+            clearTimeout(timer); if (softTimer) clearTimeout(softTimer); pending.delete(id); if (frame.isConnected) frame.remove();
             record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
             reject(error);
           }
@@ -361,11 +396,11 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.6.0-resilient-gateway-recovery",
+    version:"1.7.0-resilient-gateway-recovery-v2",
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
-    getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size}; },
+    getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12))}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
     getTenant() { return auth.tenant; },
