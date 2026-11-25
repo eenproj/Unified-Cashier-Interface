@@ -764,6 +764,10 @@ button .apotek-svg{pointer-events:none}
  background:rgba(15,23,42,.42)!important;z-index:110!important;
 }
 
+
+.uc-cart-warning{display:none;margin:9px 0 8px;padding:10px 12px;border:1px solid rgba(245,158,11,.48);border-radius:10px;background:rgba(245,158,11,.10);color:#92400e;font-size:12px;line-height:1.5}
+.uc-cart-warning.is-visible{display:block}
+.dark .uc-cart-warning{background:rgba(146,91,18,.20);border-color:rgba(245,190,90,.48);color:#ffe2ad}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
@@ -7489,6 +7493,18 @@ function unifiedBarcodeAccept_(raw,source='manual'){
  BARCODE_LAST_VALUE=code;BARCODE_LAST_AT=now;
  return code;
 }
+
+function setKasirBarcodeWarning_(message,type='warning'){
+ const el=$('ucCartWarning');if(!el)return;
+ const text=String(message||'').trim();
+ if(!text){el.textContent='';el.hidden=true;el.classList.remove('is-visible');el.dataset.state='';return;}
+ el.hidden=false;el.classList.add('is-visible');el.dataset.state=type;
+ el.style.borderColor=type==='error'?'rgba(220,38,38,.48)':type==='success'?'rgba(16,185,129,.45)':'rgba(245,158,11,.48)';
+ el.style.background=type==='error'?'rgba(220,38,38,.09)':type==='success'?'rgba(16,185,129,.09)':'rgba(245,158,11,.10)';
+ el.style.color=type==='error'?'#b91c1c':type==='success'?'#047857':'';
+ el.textContent=text;
+}
+
 function submitUnifiedBarcode(raw,source='manual',requestedMode){
  if(!UNIFIED_BARCODE_ENGINE.enabled)return Promise.resolve(null);
  const mode=resolveBarcodeMode_(requestedMode);
@@ -7496,6 +7512,7 @@ function submitUnifiedBarcode(raw,source='manual',requestedMode){
 }
 async function processBarcodeInput(raw,mode='kasir',source='manual'){
  const code=unifiedBarcodeAccept_(raw,source);if(!code)return null;
+ if(mode==='kasir')setKasirBarcodeWarning_('Barcode '+code+' diterima. Mencari produk pada database aplikasi…','warning');
  if(source==='usb-bluetooth-hid')markUsbBtScannerActivity_('ready','Input HID berhasil diterima');
  mode=resolveBarcodeMode_(mode);
  if(mode==='product'){
@@ -7523,20 +7540,21 @@ async function processBarcodeInput(raw,mode='kasir',source='manual'){
  }
  try{
   if(!OFFLINE_MODE&&navigator.onLine){try{p=await call('getProductDetail',TOKEN,p.ID)}catch(e){if(!isNetworkFailure(e))throw e;OFFLINE_MODE=true;}}
-  if(Number(p.Stok||0)<=0){barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
+  if(Number(p.Stok||0)<=0){setKasirBarcodeWarning_('Stok habis untuk '+p.NamaProduk+'. Produk tidak ditambahkan ke keranjang.','error');barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
   if(String(p.JenisObat||'').toLowerCase()==='keras'&&$('kJenisTransaksi')?.value!=='Resep'){
-   $('kJenisTransaksi').value='Resep';togglePrescriptionFields();if($('kNoResep'))$('kNoResep').focus();
+   $('kJenisTransaksi').value='Resep';togglePrescriptionFields();setKasirBarcodeWarning_('Produk '+p.NamaProduk+' termasuk obat keras. Lengkapi nomor resep sebelum menambahkan ke keranjang.','warning');if($('kNoResep'))$('kNoResep').focus();
    customAlert('Obat '+p.NamaProduk+' termasuk obat keras. Lengkapi nomor resep sebelum menambahkan ke keranjang.');return null;
   }
-  if($('kJenisTransaksi')?.value==='Resep'&&!String($('kNoResep')?.value||'').trim()){customAlert('Nomor resep wajib diisi sebelum memindai obat untuk transaksi resep.');$('kNoResep')?.focus();return null}
+  if($('kJenisTransaksi')?.value==='Resep'&&!String($('kNoResep')?.value||'').trim()){setKasirBarcodeWarning_('Nomor resep wajib diisi sebelum produk ditambahkan ke keranjang.','warning');customAlert('Nomor resep wajib diisi sebelum memindai obat untuk transaksi resep.');$('kNoResep')?.focus();return null}
   const existing=CART.find(x=>String(x.ProdukID)===String(p.ID));
   const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert('Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.');return null}
   if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
   if($('kResults'))$('kResults').innerHTML=`<span class="badge green">✓ ${esc(p.NamaProduk)} | Qty ${existing?existing.Qty:1} | Stok ${p.Stok} | ${money(p.HargaJual)}</span>`;
+  setKasirBarcodeWarning_(Number(p.StokKedaluwarsa||0)>0?'Produk '+p.NamaProduk+' ditambahkan. Terdapat stok batch kedaluwarsa yang tidak dapat dijual; periksa detail batch sebelum posting.':'Produk '+p.NamaProduk+' berhasil ditambahkan ke keranjang.','success');
   renderCart();scheduleKasirDraftSave();barcodeBeep(true);barcodePill(p.NamaProduk+' ditambahkan · Qty '+(existing?existing.Qty:1));
   return p;
- }catch(e){barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
+ }catch(e){setKasirBarcodeWarning_('Gagal memeriksa barcode: '+(e.message||e),'error');barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
 }
 // Unified Barcode Input Engine: kamera popup, input manual, USB HID, dan Bluetooth HID memakai satu jalur.
 document.addEventListener('keydown',function(e){
@@ -7669,7 +7687,7 @@ function renderKasir(){
  $('view').innerHTML=`<div class="grid2"><div class="card"><h3 class="kasir-card-title">${apotekSvg('receipt-text')}<span>Kasir</span></h3><div class="form-grid">
  <div><label>Jenis Transaksi</label><select id="kJenisTransaksi" onchange="togglePrescriptionFields()"><option value="Tanpa Resep">Tanpa Resep</option><option value="Resep">Resep</option></select></div><div id="kResepWrap" class="hidden"><label>Nomor Resep</label><input id="kNoResep" maxlength="100" placeholder="Masukkan nomor resep"></div>
  <div class="full kasir-identitas-grid"><div><label>Tanggal</label><input id="kTanggal" type="date" value="${dateInput()}"></div><div><label>No. Struk</label><input id="kStruk"></div><div><label>Pelanggan</label><input id="kCustomer" value="Umum"></div></div>
- <div class="full"><label for="kProduk">Pilih Produk / Barcode</label><div class="kasir-product-picker"><select id="kProduk"><option value="">Pilih Nama Produk</option>${kasirProductOptionsHtml_(products)}</select><button type="button" class="btn primary kasir-camera-btn" onclick="openBarcodeScanner('kasir')" title="Scan Kamera (F2)" aria-label="Scan Kamera (F2)"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="kasir-camera-icon" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/><path d="M7 9v6M10 8v8M13 9v6M16 8v8M18 10v4"/></svg><span>Scanner</span><kbd>F2</kbd></button></div><div class="barcode-manual-row" style="margin-top:8px"><input id="kBarcodeManual" placeholder="Masukkan / tembak barcode di sini" autocomplete="off" aria-label="Barcode manual"><button class="btn" type="button" onclick="submitUnifiedBarcode($('kBarcodeManual').value,'manual-button','kasir')">Cari Barcode</button></div><div id="kResults" class="muted" style="margin-top:6px">Pilih produk, pindai barcode, atau gunakan scanner USB/Bluetooth.</div></div>
+ <div class="full"><label for="kProduk">Pilih Produk / Barcode</label><div class="kasir-product-picker"><select id="kProduk"><option value="">Pilih Nama Produk</option>${kasirProductOptionsHtml_(products)}</select><button type="button" class="btn primary kasir-camera-btn" onclick="openBarcodeScanner('kasir')" title="Scan Kamera (F2)" aria-label="Scan Kamera (F2)"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="kasir-camera-icon" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/><path d="M7 9v6M10 8v8M13 9v6M16 8v8M18 10v4"/></svg><span>Scanner</span><kbd>F2</kbd></button></div><div class="barcode-manual-row" style="margin-top:8px"><input id="kBarcodeManual" placeholder="Masukkan / tembak barcode di sini" autocomplete="off" aria-label="Barcode manual"><button class="btn" type="button" onclick="submitUnifiedBarcode($('kBarcodeManual').value,'manual-button','kasir')">Cari Barcode</button></div><div id="ucCartWarning" class="uc-cart-warning" role="status" aria-live="polite" hidden></div><div id="kResults" class="muted" style="margin-top:6px">Pilih produk, pindai barcode, atau gunakan scanner USB/Bluetooth.</div></div>
  <div><label>Kuantitas</label><input id="kQty" type="number" min="1" value="1"></div><div><label>Harga Jual</label><input id="kHarga" type="number"></div>
  <div class="full">${formButton('+ Tambah ke Keranjang','addCart()')}</div></div></div>
  <div class="card"><h3 class="kasir-card-title">${apotekSvg('shopping-cart')}<span>Keranjang</span></h3><div id="cart"></div><hr><div class="kasir-cart-adjustments" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0 14px"><div><label for="kDisc">Diskon (%)</label><input id="kDisc" type="number" min="0" max="100" step="0.01" value="0" inputmode="decimal" oninput="refreshKasirSummaryOnly_()"></div><div><label for="kTax">Pajak (%)</label><input id="kTax" type="number" min="0" max="100" step="0.01" value="0" inputmode="decimal" oninput="refreshKasirSummaryOnly_()"></div></div><div id="cartSummary"></div><div id="offlineQueueNotice" class="hidden" style="margin:12px 0;padding:10px;border:1px solid #f59e0b;border-radius:10px"></div><div style="margin:14px 0"><label for="kMetodePembayaran">Metode Pembayaran</label><select id="kMetodePembayaran"><option value="Cash">Cash</option><option value="Transfer">Transfer</option><option value="Qris">Qris</option></select></div><button class="btn success" style="width:100%" onclick="checkout()">POSTING PENJUALAN & CETAK STRUK</button></div></div><div class="card section" id="kasirRecentTransactions"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h3 class="kasir-card-title" style="margin:0">${apotekSvg('history')}<span>Transaksi Terbaru</span></h3><button class="btn sm" type="button" onclick="loadKasirRecentTransactions()">↻ Refresh</button></div><div id="kasirRecentTransactionsBody" class="muted" style="margin-top:12px">Memuat transaksi terbaru...</div></div>`;
