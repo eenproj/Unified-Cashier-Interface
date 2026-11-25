@@ -7517,6 +7517,7 @@ function recordBarcodePerf_(entry){
 function getBarcodePerformanceSamples_(limit=30){try{const key=tenantStorageKey_('apotek_barcode_perf_v2');let rows=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(rows)||!rows.length){const legacy=JSON.parse(localStorage.getItem(tenantStorageKey_('apotek_barcode_perf_v1'))||'[]');rows=Array.isArray(legacy)?legacy:[];}return rows.slice(-Math.max(1,Math.min(100,Number(limit)||30)));}catch(_){return [];}}
 function clearBarcodePerformanceSamples_(){try{localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v2'));localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v1'));return true;}catch(_){return false;}}
 function getBarcodeBridgeDiagnostics_(limit=30){try{const rows=window.ApotekApiBridgeDiagnostics&&window.ApotekApiBridgeDiagnostics.get?window.ApotekApiBridgeDiagnostics.get():[];return rows.filter(x=>/getBarcodeProductFast/.test(String(x.method||''))||/REQUEST_TIMEOUT|MESSAGE_ACCEPTED|MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED|MESSAGE_REJECTED_SOURCE/.test(String(x.stage||''))).slice(-Math.max(1,Math.min(100,Number(limit)||30)));}catch(_){return [];}}
+function getBarcodeBridgePendingSummary_(){try{return window.ApotekApiBridgeDiagnostics&&window.ApotekApiBridgeDiagnostics.pending?window.ApotekApiBridgeDiagnostics.pending():{pendingCount:null,available:false};}catch(_){return {pendingCount:null,available:false};}}
 
 function setKasirBarcodeWarning_(message,type='warning'){
  const el=$('ucCartWarning');if(!el)return;
