@@ -11,7 +11,12 @@
   // Completed requests remain briefly addressable so duplicate gateway deliveries
   // can be ACKed instead of being misclassified as unknown requests.
   const completed = new Map();
-  const COMPLETED_ACK_TTL_MS = 7000;
+  const lateRequests = new Map();
+  const COMPLETED_ACK_TTL_MS = 12000;
+  const MAX_PENDING_REQUESTS = 8;
+  const LOOKUP_SOFT_TIMEOUT_MS = 12000;
+  const LOOKUP_HARD_TIMEOUT_MS = 30000;
+  const LOOKUP_FRAME_GRACE_MS = 12000;
 
   let lastDiagnostic = null;
   let refreshPromise = null;
@@ -130,6 +135,13 @@
         if (done.origin !== event.origin) record("MESSAGE_DUPLICATE_ORIGIN_CHANGED", { requestIdPrefix:id.slice(0,12), previousOrigin:done.origin, origin:event.origin });
         return;
       }
+      const late = lateRequests.get(id);
+      if (late && late.expiresAt > Date.now() && trustedGoogleResponseOrigin(event.origin)) {
+        acknowledgeResponse(event, id, true);
+        lateRequests.delete(id);
+        record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,frameConnected:!!(late.frame&&late.frame.isConnected)});
+        return;
+      }
       record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
       return;
     }
@@ -151,11 +163,11 @@
       if (p.retryTimer) clearTimeout(p.retryTimer);
       const delay = Math.max(1000, Math.min(5000, Number(data.result.retryAfterMs)||2000));
       p.retryTimer = setTimeout(() => { if (pending.has(id) && p.submitAttempt && p.attempts < 7) p.submitAttempt(true); }, delay);
-      retryTimer = p.retryTimer;
       return;
     }
     acknowledgeResponse(event, id, false);
     clearTimeout(p.timer);
+    if (p.softTimer) clearTimeout(p.softTimer);
     if (p.retryTimer) clearTimeout(p.retryTimer);
     pending.delete(id);
     // Keep the response frame alive for the backend's bounded retry window.
@@ -349,10 +361,11 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.5.2-scanner-lookup-diagnostics",
+    version:"1.6.0-resilient-gateway-recovery",
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
+    getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
     getTenant() { return auth.tenant; },
@@ -378,6 +391,6 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
