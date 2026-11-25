@@ -1,4 +1,4 @@
-/* APOTEK PWA API Bridge Client v1.7.0 — Resilient Gateway Recovery V2.
+/* APOTEK PWA API Bridge Client v1.8.0 — Late Response Correlation & Request Lifecycle Integrity V3.
  * Corrected unified timeout, bounded late-response ACK lifecycle, and request isolation.
  * Fast barcode lookup remains read-only and is never automatically retried.
  * Diagnostics contain no credentials, request payloads, or barcode values.
@@ -12,6 +12,33 @@
   // can be ACKed instead of being misclassified as unknown requests.
   const completed = new Map();
   const lateRequests = new Map();
+  // Bounded lifecycle ledger preserves terminal-state evidence without retaining
+  // payloads, credentials, or unbounded request history.
+  const lifecycle = new Map();
+  const MAX_LIFECYCLE_RECORDS = 160;
+  const TERMINAL_STATES = new Set(["COMPLETED","FAILED","TIMED_OUT","CANCELLED","EXPIRED"]);
+  function lifecycleTransition(id, next, detail) {
+    const now = Date.now();
+    let item = lifecycle.get(id);
+    if (!item) {
+      item = { requestIdPrefix:String(id).slice(0,12), state:"CREATED", createdAt:now, updatedAt:now, transitions:0 };
+      lifecycle.set(id,item);
+    }
+    const previous = item.state;
+    if (TERMINAL_STATES.has(previous) && previous !== next) {
+      record("LIFECYCLE_TRANSITION_REJECTED", {requestIdPrefix:item.requestIdPrefix, previousState:previous, attemptedState:next});
+      return false;
+    }
+    if (previous === next) {
+      record("LIFECYCLE_DUPLICATE_TRANSITION", {requestIdPrefix:item.requestIdPrefix, state:next});
+      return false;
+    }
+    item.state=next; item.updatedAt=now; item.transitions++;
+    if (detail && detail.method) item.method=String(detail.method).slice(0,60);
+    record("LIFECYCLE_TRANSITION", Object.assign({requestIdPrefix:item.requestIdPrefix,previousState:previous,nextState:next,transitionCount:item.transitions},detail||{}));
+    while (lifecycle.size > MAX_LIFECYCLE_RECORDS) lifecycle.delete(lifecycle.keys().next().value);
+    return true;
+  }
   const COMPLETED_ACK_TTL_MS = 12000;
   const MAX_PENDING_REQUESTS = 8;
   const MAX_LATE_RESPONSE_WATCHES = 8;
@@ -142,11 +169,15 @@
       if (late && late.expiresAt > Date.now() && trustedGoogleResponseOrigin(event.origin)) {
         // A timed-out operation is terminal for the UI. ACK only to stop gateway
         // redelivery; never resolve the original Promise or apply its payload.
-        acknowledgeResponse(event, id, true);
+        const frameConnectedBeforeCleanup = !!(late.frame && late.frame.isConnected);
+        const acked = acknowledgeResponse(event, id, true);
+        late.responseObservedAt = Date.now();
+        late.acknowledged = !!acked;
         lateRequests.delete(id);
         clearTimeout(late.cleanupTimer);
         if (late.frame && late.frame.isConnected) late.frame.remove();
-        record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,frameConnectedBeforeCleanup:!!(late.frame&&late.frame.isConnected),payloadApplied:false});
+        record("LIFECYCLE_LATE_RESPONSE_RECONCILED", {requestIdPrefix:id.slice(0,12),terminalState:"TIMED_OUT",payloadApplied:false});
+        record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,acknowledged:!!acked,frameConnectedBeforeCleanup,payloadApplied:false});
         return;
       }
       record("MESSAGE_UNKNOWN_REQUEST", { requestIdPrefix:id.slice(0,12), origin:event.origin });
@@ -172,7 +203,9 @@
       p.retryTimer = setTimeout(() => { if (pending.has(id) && p.submitAttempt && p.attempts < 7) p.submitAttempt(true); }, delay);
       return;
     }
-    acknowledgeResponse(event, id, false);
+    const responseAcked = acknowledgeResponse(event, id, false);
+    p.responseObservedAt = Date.now();
+    p.responseAcked = !!responseAcked;
     clearTimeout(p.timer);
     if (p.softTimer) clearTimeout(p.softTimer);
     if (p.retryTimer) clearTimeout(p.retryTimer);
@@ -191,10 +224,12 @@
       const apiCode=String(data.result && data.result.code || "BACKEND_ERROR").slice(0,80);
       record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:apiCode, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, origin:event.origin });
       const apiError=new Error(String(data.result && data.result.message || "Permintaan API gagal."));apiError.code=apiCode;apiError.bridgeTrace=bridgeTrace;apiError.gatewayTrace=data.result&&data.result.gatewayTrace||null;
+      lifecycleTransition(id, "FAILED", {method:p.method,code:apiCode});
       p.reject(apiError);
       return;
     }
     record("MESSAGE_ACCEPTED", { requestIdPrefix:id.slice(0,12), method:p.method, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, nestedFrameAccepted:bridgeTrace.nestedFrameAccepted, origin:event.origin });
+    lifecycleTransition(id, "COMPLETED", {method:p.method,elapsedMs:bridgeTrace.elapsedMs,acknowledged:!!responseAcked});
     const payload=data.result.data;
     if(payload&&typeof payload==="object"&&!Array.isArray(payload))p.resolve(Object.assign({},payload,{__bridgeTrace:bridgeTrace}));
     else p.resolve(payload);
@@ -244,6 +279,7 @@
         if (p.retryTimer) clearTimeout(p.retryTimer);
         const frameConnectedBeforeCleanup = !!frame.isConnected;
         pending.delete(id);
+        lifecycleTransition(id, "TIMED_OUT", {method:String(method),timeoutMs:timeoutMs});
         const elapsedMs=Date.now()-startedAt;
         const trace={requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:elapsedMs,attempts:attempts,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:null,lastMessageStage:p.lastMessageStage||null,visibility:document.visibilityState};
         record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, pendingCount:pending.size });
@@ -273,11 +309,13 @@
       }, LOOKUP_SOFT_WARNING_MS) : null;
       const p = { resolve, reject, timer, softTimer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
       pending.set(id, p);
+      lifecycleTransition(id, "SUBMITTED", {method:String(method)});
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
         attempts++;
         p.attempts=attempts;
         const submitAt=Date.now();if(!p.firstSubmitAt)p.firstSubmitAt=submitAt;p.lastSubmitAt=submitAt;
+        if (attempts > 1) record("LIFECYCLE_RESUBMIT_SAME_ID", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),attempt:attempts});
         record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host, visibility:document.visibilityState });
         const form = document.createElement("form");
         form.method = "POST";
@@ -302,6 +340,7 @@
             p.retryTimer = retryTimer;
           } else {
             clearTimeout(timer); if (softTimer) clearTimeout(softTimer); pending.delete(id); if (frame.isConnected) frame.remove();
+            lifecycleTransition(id, "FAILED", {method:String(method),reason:"submit_failed"});
             record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
             reject(error);
           }
@@ -396,11 +435,16 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.7.0-resilient-gateway-recovery-v2",
+    version:"1.8.0-resilient-gateway-correlation-v3",
+    getLifecycleSummary() {
+      const counts = {};
+      for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
+      return {trackedCount:lifecycle.size, maxRecords:MAX_LIFECYCLE_RECORDS, stateCounts:counts, recent:Array.from(lifecycle.values()).slice(-30).map(x=>({requestIdPrefix:x.requestIdPrefix,method:x.method||null,state:x.state,transitions:x.transitions,ageMs:Date.now()-x.createdAt}))};
+    },
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
-    getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12))}; },
+    getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12)),lifecycleCount:lifecycle.size,lifecycleStates:this.getLifecycleSummary().stateCounts}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
     getTenant() { return auth.tenant; },
@@ -426,6 +470,6 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
