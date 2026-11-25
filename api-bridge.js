@@ -1,6 +1,7 @@
-/* APOTEK PWA API Bridge Client v1.5.1 — Retry Timing Correction & Session Recovery.
- * Preserves Hotfix 4.14 nested-frame correlation; retries reuse the same requestId.
- * Diagnostic records never contain payloads or tokens.
+/* APOTEK PWA API Bridge Client v1.5.2 — Scanner Lookup Latency & Failure Classification.
+ * Preserves Hotfix 4.14 nested-frame correlation and requestId safeguards.
+ * Fast barcode lookup is read-only: no automatic retry and a bounded 15s timeout.
+ * Diagnostics contain no credentials, request payloads, or barcode values.
  */
 (() => {
   "use strict";
@@ -165,13 +166,19 @@
       if (completed.get(id) === done) completed.delete(id);
       if (p.frame && p.frame.isConnected) p.frame.remove();
     }, COMPLETED_ACK_TTL_MS);
+    const responseAt=Date.now();
+    const bridgeTrace={requestIdPrefix:id.slice(0,12),method:p.method,elapsedMs:responseAt-p.startedAt,attempts:Number(p.attempts)||0,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:responseAt,lastMessageStage:p.lastMessageStage||"MESSAGE_RECEIVED",nestedFrameAccepted:!sourceMatchesFrame,gatewayTrace:data.result&&data.result.gatewayTrace||data.result&&data.result.data&&data.result.data._gatewayTrace||null};
     if (!data.result || data.result.ok !== true) {
-      record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:String(data.result && data.result.code || "").slice(0,80), origin:event.origin });
-      p.reject(new Error(String(data.result && data.result.message || "Permintaan API gagal.")));
+      const apiCode=String(data.result && data.result.code || "BACKEND_ERROR").slice(0,80);
+      record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:apiCode, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, origin:event.origin });
+      const apiError=new Error(String(data.result && data.result.message || "Permintaan API gagal."));apiError.code=apiCode;apiError.bridgeTrace=bridgeTrace;apiError.gatewayTrace=data.result&&data.result.gatewayTrace||null;
+      p.reject(apiError);
       return;
     }
-    record("MESSAGE_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
-    p.resolve(data.result.data);
+    record("MESSAGE_ACCEPTED", { requestIdPrefix:id.slice(0,12), method:p.method, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, nestedFrameAccepted:bridgeTrace.nestedFrameAccepted, origin:event.origin });
+    const payload=data.result.data;
+    if(payload&&typeof payload==="object"&&!Array.isArray(payload))p.resolve(Object.assign({},payload,{__bridgeTrace:bridgeTrace}));
+    else p.resolve(payload);
   }
   window.addEventListener("message", event => {
     const data = event.data;
@@ -198,7 +205,9 @@
     if (!navigator.onLine) return Promise.reject(new Error("Perangkat sedang offline. API server tidak dapat dipanggil."));
     const id = requestIdOverride || makeId();
     const frame = createFrame(id);
-    const safeRetryEnabled = true; // Backend requestId registry prevents duplicate mutation execution.
+    const isFastBarcodeLookup=String(method)==="getBarcodeProductFast";
+    const safeRetryEnabled = !isFastBarcodeLookup; // Lookup is read-only; avoid queue amplification.
+    const timeoutMs=isFastBarcodeLookup?15000:60000;
     return new Promise((resolve, reject) => {
       const startedAt = Date.now();
       let attempts = 0;
@@ -209,15 +218,19 @@
         pending.delete(id);
         if (frame.isConnected) frame.remove();
         record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnected:frame.isConnected, pendingCount:pending.size });
-        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:Date.now()-startedAt, lastMessageStage:p.lastMessageStage || null });
-        reject(new Error("Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi."));
-      }, 60000);
-      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null };
+        const elapsedMs=Date.now()-startedAt;
+        const trace={requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:elapsedMs,attempts:attempts,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:null,lastMessageStage:p.lastMessageStage||null,visibility:document.visibilityState};
+        record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:elapsedMs, timeoutMs:timeoutMs, lastMessageStage:p.lastMessageStage || null });
+        const timeoutError=new Error(isFastBarcodeLookup?"Pencarian barcode melewati batas waktu tunggu. Status produk belum dapat dipastikan.":"Gateway tidak memberikan respons. Periksa koneksi sebelum mengulangi transaksi.");
+        timeoutError.code="GATEWAY_TIMEOUT";timeoutError.bridgeTrace=trace;reject(timeoutError);
+      }, timeoutMs);
+      const p = { resolve, reject, timer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
       pending.set(id, p);
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
         attempts++;
         p.attempts=attempts;
+        const submitAt=Date.now();if(!p.firstSubmitAt)p.firstSubmitAt=submitAt;p.lastSubmitAt=submitAt;
         record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host, visibility:document.visibilityState });
         const form = document.createElement("form");
         form.method = "POST";
@@ -336,7 +349,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.5.1-idempotency-recovery",
+    version:"1.5.2-scanner-lookup-diagnostics",
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
