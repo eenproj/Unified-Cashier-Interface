@@ -4373,7 +4373,7 @@ const $=id=>document.getElementById(id);
 ['click','keydown','mousemove','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,()=>{LAST_ACTIVITY=Date.now()},{passive:true}));
 // Deduplicasi hanya untuk request baca yang identik dan sedang berjalan bersamaan.
 // Mutasi tidak pernah digabung agar setiap aksi pengguna tetap dieksekusi satu kali.
-const READ_API_CALLS=new Set(['bootstrap','bootstrapShell','getDataRevision','getBootstrapMaster','getBootstrapProducts','getBootstrapProductsPage','getDashboard','getMaster','getUsersPage','getDashboardChart','getNotifications','getPurchaseOrderOptions','getMyFeatureAccess','getApotekBranding','getApotekProfile','getApotekProfileStatus','getConfig','getSalesNotificationFeed','getStockCard','getStockCardPage','getReportPreview','getInventory','getInventoryPage','getTransactions','getTransactionsPage','getSaleReturnEligibility','getSoldProductIds','getAuditLogs','getBackupStatus','getSpreadsheetHealth','getBatchStockIntegrity','runTahap4DReadOnlyStressTest','validateBackupFile','validateBackupDryRun','getAuditLogRetentionSettings','saveAuditLogRetentionSettings','createAuditLogBackup','restoreAuditLogBackup','listLicenses','listTenants','getSystemHealthHistory','runDataIntegrityCenter','getPostTransactionIntegrityReport']);
+const READ_API_CALLS=new Set(['bootstrap','bootstrapShell','getDataRevision','getBootstrapMaster','getBootstrapProducts','getBootstrapProductsPage','getDashboard','getMaster','getUsersPage','getDashboardChart','getNotifications','getPurchaseOrderOptions','getMyFeatureAccess','getApotekBranding','getApotekProfile','getApotekProfileStatus','getConfig','getSalesNotificationFeed','getStockCard','getStockCardPage','getReportPreview','getInventory','getInventoryPage','getTransactions','getTransactionsPage','getBarcodeProductFast','getSaleReturnEligibility','getSoldProductIds','getAuditLogs','getBackupStatus','getSpreadsheetHealth','getBatchStockIntegrity','runTahap4DReadOnlyStressTest','validateBackupFile','validateBackupDryRun','getAuditLogRetentionSettings','saveAuditLogRetentionSettings','createAuditLogBackup','restoreAuditLogBackup','listLicenses','listTenants','getSystemHealthHistory','runDataIntegrityCenter','getPostTransactionIntegrityReport']);
 const API_INFLIGHT_READS=new Map(),API_INFLIGHT_MUTATIONS=new Map();
 function call(fn,...args){
  if(!navigator.onLine)return Promise.reject(new Error('Koneksi internet tidak tersedia.'));
@@ -7401,7 +7401,7 @@ window.addEventListener('message',function(event){
    const existing=BARCODE_KASIR_REQUESTS.get(requestId);
    if(existing){ack('received',true,'Barcode sudah diterima; proses sebelumnya sedang berjalan.');existing.then(result=>ack('completed',!!result,result?'Produk berhasil ditambahkan ke keranjang.': 'Produk tidak dapat ditambahkan. Periksa pesan pada aplikasi Kasir.'));return;}
    ack('received',true,'Barcode diterima aplikasi Kasir. Memeriksa produk…');
-   const task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir'));
+   const task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,detectedAt:data.detectedAt}));
    BARCODE_KASIR_REQUESTS.set(requestId,task);
    task.then(result=>ack('completed',!!result,result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.'))
     .catch(error=>ack('completed',false,String(error?.message||error||'Gagal memproses barcode.')))
@@ -7504,6 +7504,19 @@ function unifiedBarcodeAccept_(raw,source='manual'){
  return code;
 }
 
+/* ================= BARCODE PERFORMANCE INSTRUMENTATION — STAGE A/B =================
+ * Client-side timing only; records durations, never barcode values or credentials.
+ */
+function barcodePerfNow_(){return (window.performance&&performance.now)?performance.now():Date.now();}
+function recordBarcodePerf_(entry){
+ const item={at:new Date().toISOString(),mode:String(entry.mode||'kasir'),source:String(entry.source||'unknown'),cameraToDecodeMs:Number.isFinite(Number(entry.cameraToDecodeMs))?Number(entry.cameraToDecodeMs):null,scannerHandoffMs:Number.isFinite(Number(entry.scannerHandoffMs))?Number(entry.scannerHandoffMs):null,localLookupMs:Number(entry.localLookupMs||0),serverLookupMs:Number(entry.serverLookupMs||0),serverReportedMs:Number(entry.serverReportedMs||0),validationMs:Number(entry.validationMs||0),cartRenderMs:Number(entry.cartRenderMs||0),totalClientMs:Number(entry.totalClientMs||0),lookupPath:String(entry.lookupPath||'none'),result:String(entry.result||'unknown')};
+ try{const key=tenantStorageKey_('apotek_barcode_perf_v1');const rows=JSON.parse(localStorage.getItem(key)||'[]');rows.push(item);while(rows.length>100)rows.shift();localStorage.setItem(key,JSON.stringify(rows));}catch(_){}
+ try{console.info('[APOTEK_BARCODE_PERF]',item);}catch(_){}
+ return item;
+}
+function getBarcodePerformanceSamples_(limit=30){try{const key=tenantStorageKey_('apotek_barcode_perf_v1');const rows=JSON.parse(localStorage.getItem(key)||'[]');return Array.isArray(rows)?rows.slice(-Math.max(1,Math.min(100,Number(limit)||30))):[];}catch(_){return [];}}
+function clearBarcodePerformanceSamples_(){try{localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v1'));return true;}catch(_){return false;}}
+
 function setKasirBarcodeWarning_(message,type='warning'){
  const el=$('ucCartWarning');if(!el)return;
  const text=String(message||'').trim();
@@ -7513,56 +7526,75 @@ function setKasirBarcodeWarning_(message,type='warning'){
  el.textContent=text;
 }
 
-function submitUnifiedBarcode(raw,source='manual',requestedMode){
+function submitUnifiedBarcode(raw,source='manual',requestedMode,perfMeta){
  if(!UNIFIED_BARCODE_ENGINE.enabled)return Promise.resolve(null);
  const mode=resolveBarcodeMode_(requestedMode);
- return processBarcodeInput(raw,mode,source);
+ return processBarcodeInput(raw,mode,source,perfMeta);
 }
-async function processBarcodeInput(raw,mode='kasir',source='manual'){
+async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
+ const started=barcodePerfNow_(),perf={mode,source,cameraToDecodeMs:perfMeta&&perfMeta.cameraToDecodeMs,scannerHandoffMs:perfMeta&&perfMeta.detectedAt?Math.max(0,Date.now()-Number(perfMeta.detectedAt)):null,localLookupMs:0,serverLookupMs:0,serverReportedMs:0,validationMs:0,cartRenderMs:0,totalClientMs:0,lookupPath:'none',result:'started'};
  const code=unifiedBarcodeAccept_(raw,source);if(!code)return null;
  if(mode==='kasir')setKasirBarcodeWarning_('Barcode '+code+' diterima. Mencari produk pada database aplikasi…','warning');
  if(source==='usb-bluetooth-hid')markUsbBtScannerActivity_('ready','Input HID berhasil diterima');
- mode=resolveBarcodeMode_(mode);
+ mode=resolveBarcodeMode_(mode);perf.mode=mode;
  if(mode==='product'){
   const input=$('fBarcode');if(input){input.value=String(raw).trim();input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();}
-  barcodeBeep(true);barcodePill('Barcode '+code+' terisi pada formulir produk');return {barcode:code};
+  barcodeBeep(true);barcodePill('Barcode '+code+' terisi pada formulir produk');perf.result='product_form_filled';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);return {barcode:code};
  }
+ const localStart=barcodePerfNow_();
  const products=DATA?.master?.produk||[];
  let p=products.find(x=>barcodeNorm(x.Barcode)===code||barcodeNorm(x.KodeProduk)===code);
- // DATA.master pada tab yang lama dapat tertinggal setelah produk ditambahkan dari
- // perangkat lain. Jika cache lokal tidak menemukan barcode, cari langsung di server.
- if(!p&&TOKEN&&navigator.onLine){
+ perf.localLookupMs=barcodePerfNow_()-localStart;
+ // Satu round-trip server untuk lookup barcode + stok batch. Server memakai Product Index
+ // dan Batch Index tenant, sehingga tidak mengambil 30 hasil pencarian dan tidak memanggil
+ // getProductDetail sebagai request kedua.
+ if(TOKEN&&navigator.onLine&&!OFFLINE_MODE){
+  const serverStart=barcodePerfNow_();
   try{
-   const matches=await call('getProductSearch',TOKEN,code);
-   p=(Array.isArray(matches)?matches:[]).find(x=>barcodeNorm(x.Barcode)===code||barcodeNorm(x.KodeProduk)===code)||null;
+   const result=await call('getBarcodeProductFast',TOKEN,code);
+   perf.serverLookupMs=barcodePerfNow_()-serverStart;
+   perf.serverReportedMs=Number(result&&result.serverElapsedMs||0);
+   perf.lookupPath='indexed_server_single_request';
+   p=result&&result.found?result.product:null;
    if(p){
     if(!DATA)DATA={};if(!DATA.master)DATA.master={};if(!Array.isArray(DATA.master.produk))DATA.master.produk=[];
     const ix=DATA.master.produk.findIndex(x=>String(x.ID)===String(p.ID));
     if(ix>=0)DATA.master.produk[ix]=p;else DATA.master.produk.push(p);
    }
-  }catch(lookupError){console.warn('[Barcode Queue] Pencarian barcode ke server gagal:',lookupError&&lookupError.message||lookupError)}
- }
- if(!p){
-  if($('kResults'))$('kResults').innerHTML='<span class="error">Barcode/kode '+esc(code)+' tidak ditemukan di Master Produk. Data lokal dan server sudah diperiksa.</span>';
-  barcodeBeep(false);barcodePill('Barcode '+code+' tidak ditemukan',false);return null;
- }
+  }catch(lookupError){
+   perf.serverLookupMs=barcodePerfNow_()-serverStart;
+   console.warn('[Barcode Fast Lookup] Permintaan lookup cepat gagal:',lookupError&&lookupError.message||lookupError);
+   // Compatibility fallback hanya jika deployment belum memiliki endpoint baru.
+   const errorText=String(lookupError&&lookupError.message||lookupError);const unavailable=/getBarcodeProductFast/i.test(errorText)&&/(tidak tersedia|not available|not found|undefined|unknown function)/i.test(errorText);
+   p=null;
+   if(unavailable){
+    const fallbackStart=barcodePerfNow_();
+    try{const matches=await call('getProductSearch',TOKEN,code);p=(Array.isArray(matches)?matches:[]).find(x=>barcodeNorm(x.Barcode)===code||barcodeNorm(x.KodeProduk)===code)||null;if(p)p=await call('getProductDetail',TOKEN,p.ID);perf.serverLookupMs+=barcodePerfNow_()-fallbackStart;perf.lookupPath='legacy_fallback_search_detail';}
+    catch(fallbackError){console.warn('[Barcode Fast Lookup] Fallback legacy gagal:',fallbackError&&fallbackError.message||fallbackError);}
+   }
+  }
+ }else if(p){perf.lookupPath='local_offline_cache';}
  try{
-  if(!OFFLINE_MODE&&navigator.onLine){try{p=await call('getProductDetail',TOKEN,p.ID)}catch(e){if(!isNetworkFailure(e))throw e;OFFLINE_MODE=true;}}
-  if(Number(p.Stok||0)<=0){setKasirBarcodeWarning_('Stok habis untuk '+p.NamaProduk+'. Produk tidak ditambahkan ke keranjang.','error');barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
+  const validationStart=barcodePerfNow_();
+  if(!p){perf.result='product_not_found';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if($('kResults'))$('kResults').innerHTML='<span class="error">Barcode/kode '+esc(code)+' tidak ditemukan di Master Produk. Data lokal dan server sudah diperiksa.</span>';barcodeBeep(false);barcodePill('Barcode '+code+' tidak ditemukan',false);return null;}
+  if(Number(p.Stok||0)<=0){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='out_of_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Stok habis untuk '+p.NamaProduk+'. Produk tidak ditambahkan ke keranjang.','error');barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
   if(String(p.JenisObat||'').toLowerCase()==='keras'&&$('kJenisTransaksi')?.value!=='Resep'){
+   perf.validationMs=barcodePerfNow_()-validationStart;perf.result='prescription_required';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
    $('kJenisTransaksi').value='Resep';togglePrescriptionFields();setKasirBarcodeWarning_('Produk '+p.NamaProduk+' termasuk obat keras. Lengkapi nomor resep sebelum menambahkan ke keranjang.','warning');if($('kNoResep'))$('kNoResep').focus();
    customAlert('Obat '+p.NamaProduk+' termasuk obat keras. Lengkapi nomor resep sebelum menambahkan ke keranjang.');return null;
   }
-  if($('kJenisTransaksi')?.value==='Resep'&&!String($('kNoResep')?.value||'').trim()){setKasirBarcodeWarning_('Nomor resep wajib diisi sebelum produk ditambahkan ke keranjang.','warning');customAlert('Nomor resep wajib diisi sebelum memindai obat untuk transaksi resep.');$('kNoResep')?.focus();return null}
+  if($('kJenisTransaksi')?.value==='Resep'&&!String($('kNoResep')?.value||'').trim()){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='prescription_number_required';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Nomor resep wajib diisi sebelum produk ditambahkan ke keranjang.','warning');customAlert('Nomor resep wajib diisi sebelum memindai obat untuk transaksi resep.');$('kNoResep')?.focus();return null}
   const existing=CART.find(x=>String(x.ProdukID)===String(p.ID));
-  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert('Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.');return null}
+  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert('Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.');return null}
+  perf.validationMs=barcodePerfNow_()-validationStart;
   if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
   if($('kResults'))$('kResults').innerHTML=`<span class="badge green">✓ ${esc(p.NamaProduk)} | Qty ${existing?existing.Qty:1} | Stok ${p.Stok} | ${money(p.HargaJual)}</span>`;
   setKasirBarcodeWarning_(Number(p.StokKedaluwarsa||0)>0?'Produk '+p.NamaProduk+' ditambahkan. Terdapat stok batch kedaluwarsa yang tidak dapat dijual; periksa detail batch sebelum posting.':'Produk '+p.NamaProduk+' berhasil ditambahkan ke keranjang.','success');
-  renderCart();scheduleKasirDraftSave();barcodeBeep(true);barcodePill(p.NamaProduk+' ditambahkan · Qty '+(existing?existing.Qty:1));
+  const cartStart=barcodePerfNow_();renderCart();scheduleKasirDraftSave();perf.cartRenderMs=barcodePerfNow_()-cartStart;barcodeBeep(true);barcodePill(p.NamaProduk+' ditambahkan · Qty '+(existing?existing.Qty:1));
+  perf.result='added_to_cart';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
   return p;
- }catch(e){setKasirBarcodeWarning_('Gagal memeriksa barcode: '+(e.message||e),'error');barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
+ }catch(e){perf.result='processing_error';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Gagal memeriksa barcode: '+(e.message||e),'error');barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
 }
 // Unified Barcode Input Engine: kamera popup, input manual, USB HID, dan Bluetooth HID memakai satu jalur.
 document.addEventListener('keydown',function(e){
