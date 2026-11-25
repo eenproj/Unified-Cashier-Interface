@@ -7401,7 +7401,7 @@ window.addEventListener('message',function(event){
    const existing=BARCODE_KASIR_REQUESTS.get(requestId);
    if(existing){ack('received',true,'Barcode sudah diterima; proses sebelumnya sedang berjalan.');existing.then(result=>ack('completed',!!result,result?'Produk berhasil ditambahkan ke keranjang.': 'Produk tidak dapat ditambahkan. Periksa pesan pada aplikasi Kasir.'));return;}
    ack('received',true,'Barcode diterima aplikasi Kasir. Memeriksa produk…');
-   const task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,detectedAt:data.detectedAt}));
+   const task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,cameraSessionElapsedMs:data.cameraSessionElapsedMs,decodeProcessingMs:data.decodeProcessingMs,detectedAt:data.detectedAt}));
    BARCODE_KASIR_REQUESTS.set(requestId,task);
    task.then(result=>ack('completed',!!result,result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.'))
     .catch(error=>ack('completed',false,String(error?.message||error||'Gagal memproses barcode.')))
@@ -7509,13 +7509,14 @@ function unifiedBarcodeAccept_(raw,source='manual'){
  */
 function barcodePerfNow_(){return (window.performance&&performance.now)?performance.now():Date.now();}
 function recordBarcodePerf_(entry){
- const item={at:new Date().toISOString(),mode:String(entry.mode||'kasir'),source:String(entry.source||'unknown'),cameraToDecodeMs:Number.isFinite(Number(entry.cameraToDecodeMs))?Number(entry.cameraToDecodeMs):null,scannerHandoffMs:Number.isFinite(Number(entry.scannerHandoffMs))?Number(entry.scannerHandoffMs):null,localLookupMs:Number(entry.localLookupMs||0),serverLookupMs:Number(entry.serverLookupMs||0),serverReportedMs:Number(entry.serverReportedMs||0),validationMs:Number(entry.validationMs||0),cartRenderMs:Number(entry.cartRenderMs||0),totalClientMs:Number(entry.totalClientMs||0),lookupPath:String(entry.lookupPath||'none'),result:String(entry.result||'unknown')};
- try{const key=tenantStorageKey_('apotek_barcode_perf_v1');const rows=JSON.parse(localStorage.getItem(key)||'[]');rows.push(item);while(rows.length>100)rows.shift();localStorage.setItem(key,JSON.stringify(rows));}catch(_){}
- try{console.info('[APOTEK_BARCODE_PERF]',item);}catch(_){}
+ const item={at:new Date().toISOString(),mode:String(entry.mode||'kasir'),source:String(entry.source||'unknown'),cameraToDecodeMs:entry.cameraToDecodeMs!==null&&entry.cameraToDecodeMs!==undefined&&Number.isFinite(Number(entry.cameraToDecodeMs))?Number(entry.cameraToDecodeMs):null,cameraSessionElapsedMs:entry.cameraSessionElapsedMs!==null&&entry.cameraSessionElapsedMs!==undefined&&Number.isFinite(Number(entry.cameraSessionElapsedMs))?Number(entry.cameraSessionElapsedMs):null,decodeProcessingMs:entry.decodeProcessingMs!==null&&entry.decodeProcessingMs!==undefined&&Number.isFinite(Number(entry.decodeProcessingMs))?Number(entry.decodeProcessingMs):null,scannerHandoffMs:entry.scannerHandoffMs!==null&&entry.scannerHandoffMs!==undefined&&Number.isFinite(Number(entry.scannerHandoffMs))?Number(entry.scannerHandoffMs):null,localLookupMs:Number(entry.localLookupMs||0),serverLookupMs:Number(entry.serverLookupMs||0),serverReportedMs:Number(entry.serverReportedMs||0),serverTiming:entry.serverTiming&&typeof entry.serverTiming==='object'?entry.serverTiming:null,gatewayTrace:entry.gatewayTrace&&typeof entry.gatewayTrace==='object'?entry.gatewayTrace:null,bridgeTrace:entry.bridgeTrace&&typeof entry.bridgeTrace==='object'?entry.bridgeTrace:null,validationMs:Number(entry.validationMs||0),cartRenderMs:Number(entry.cartRenderMs||0),totalClientMs:Number(entry.totalClientMs||0),lookupPath:String(entry.lookupPath||'none'),result:String(entry.result||'unknown'),failureCode:String(entry.failureCode||'')};
+ try{const key=tenantStorageKey_('apotek_barcode_perf_v2');const rows=JSON.parse(localStorage.getItem(key)||'[]');rows.push(item);while(rows.length>100)rows.shift();localStorage.setItem(key,JSON.stringify(rows));}catch(_){}
+ try{console.info('[APOTEK_BARCODE_PERF_V2]',item);}catch(_){}
  return item;
 }
-function getBarcodePerformanceSamples_(limit=30){try{const key=tenantStorageKey_('apotek_barcode_perf_v1');const rows=JSON.parse(localStorage.getItem(key)||'[]');return Array.isArray(rows)?rows.slice(-Math.max(1,Math.min(100,Number(limit)||30))):[];}catch(_){return [];}}
-function clearBarcodePerformanceSamples_(){try{localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v1'));return true;}catch(_){return false;}}
+function getBarcodePerformanceSamples_(limit=30){try{const key=tenantStorageKey_('apotek_barcode_perf_v2');let rows=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(rows)||!rows.length){const legacy=JSON.parse(localStorage.getItem(tenantStorageKey_('apotek_barcode_perf_v1'))||'[]');rows=Array.isArray(legacy)?legacy:[];}return rows.slice(-Math.max(1,Math.min(100,Number(limit)||30)));}catch(_){return [];}}
+function clearBarcodePerformanceSamples_(){try{localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v2'));localStorage.removeItem(tenantStorageKey_('apotek_barcode_perf_v1'));return true;}catch(_){return false;}}
+function getBarcodeBridgeDiagnostics_(limit=30){try{const rows=window.ApotekApiBridgeDiagnostics&&window.ApotekApiBridgeDiagnostics.get?window.ApotekApiBridgeDiagnostics.get():[];return rows.filter(x=>/getBarcodeProductFast/.test(String(x.method||''))||/REQUEST_TIMEOUT|MESSAGE_ACCEPTED|MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED|MESSAGE_REJECTED_SOURCE/.test(String(x.stage||''))).slice(-Math.max(1,Math.min(100,Number(limit)||30)));}catch(_){return [];}}
 
 function setKasirBarcodeWarning_(message,type='warning'){
  const el=$('ucCartWarning');if(!el)return;
@@ -7532,7 +7533,7 @@ function submitUnifiedBarcode(raw,source='manual',requestedMode,perfMeta){
  return processBarcodeInput(raw,mode,source,perfMeta);
 }
 async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
- const started=barcodePerfNow_(),perf={mode,source,cameraToDecodeMs:perfMeta&&perfMeta.cameraToDecodeMs,scannerHandoffMs:perfMeta&&perfMeta.detectedAt?Math.max(0,Date.now()-Number(perfMeta.detectedAt)):null,localLookupMs:0,serverLookupMs:0,serverReportedMs:0,validationMs:0,cartRenderMs:0,totalClientMs:0,lookupPath:'none',result:'started'};
+ const started=barcodePerfNow_(),perf={mode,source,cameraToDecodeMs:perfMeta&&perfMeta.cameraToDecodeMs,cameraSessionElapsedMs:perfMeta&&perfMeta.cameraSessionElapsedMs,decodeProcessingMs:perfMeta&&perfMeta.decodeProcessingMs,scannerHandoffMs:perfMeta&&perfMeta.detectedAt?Math.max(0,Date.now()-Number(perfMeta.detectedAt)):null,localLookupMs:0,serverLookupMs:0,serverReportedMs:0,serverTiming:null,gatewayTrace:null,bridgeTrace:null,validationMs:0,cartRenderMs:0,totalClientMs:0,lookupPath:'none',result:'started',failureCode:''};
  const code=unifiedBarcodeAccept_(raw,source);if(!code)return null;
  if(mode==='kasir')setKasirBarcodeWarning_('Barcode '+code+' diterima. Mencari produk pada database aplikasi…','warning');
  if(source==='usb-bluetooth-hid')markUsbBtScannerActivity_('ready','Input HID berhasil diterima');
@@ -7545,38 +7546,54 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
  const products=DATA?.master?.produk||[];
  let p=products.find(x=>barcodeNorm(x.Barcode)===code||barcodeNorm(x.KodeProduk)===code);
  perf.localLookupMs=barcodePerfNow_()-localStart;
- // Satu round-trip server untuk lookup barcode + stok batch. Server memakai Product Index
- // dan Batch Index tenant, sehingga tidak mengambil 30 hasil pencarian dan tidak memanggil
- // getProductDetail sebagai request kedua.
+ // Satu round-trip server untuk lookup barcode + stok batch.
+ // A2/B4: hanya respons found:false yang valid boleh diklasifikasikan sebagai product_not_found.
  if(TOKEN&&navigator.onLine&&!OFFLINE_MODE){
   const serverStart=barcodePerfNow_();
   try{
    const result=await call('getBarcodeProductFast',TOKEN,code);
    perf.serverLookupMs=barcodePerfNow_()-serverStart;
    perf.serverReportedMs=Number(result&&result.serverElapsedMs||0);
+   perf.serverTiming=result&&result.serverTiming||null;
+   perf.gatewayTrace=result&&result._gatewayTrace||null;
+   perf.bridgeTrace=result&&result.__bridgeTrace||null;
    perf.lookupPath='indexed_server_single_request';
-   p=result&&result.found?result.product:null;
+   if(!result||result.ok!==true||typeof result.found!=='boolean'){
+    const invalid=new Error('Respons lookup backend tidak memiliki format yang valid.');invalid.code='INVALID_LOOKUP_RESPONSE';throw invalid;
+   }
+   p=result.found?result.product:null;
    if(p){
     if(!DATA)DATA={};if(!DATA.master)DATA.master={};if(!Array.isArray(DATA.master.produk))DATA.master.produk=[];
     const ix=DATA.master.produk.findIndex(x=>String(x.ID)===String(p.ID));
     if(ix>=0)DATA.master.produk[ix]=p;else DATA.master.produk.push(p);
-   }
+   }else{perf.result='product_not_found';}
   }catch(lookupError){
-   perf.serverLookupMs=barcodePerfNow_()-serverStart;
-   console.warn('[Barcode Fast Lookup] Permintaan lookup cepat gagal:',lookupError&&lookupError.message||lookupError);
-   // Compatibility fallback hanya jika deployment belum memiliki endpoint baru.
-   const errorText=String(lookupError&&lookupError.message||lookupError);const unavailable=/getBarcodeProductFast/i.test(errorText)&&/(tidak tersedia|not available|not found|undefined|unknown function)/i.test(errorText);
-   p=null;
-   if(unavailable){
-    const fallbackStart=barcodePerfNow_();
-    try{const matches=await call('getProductSearch',TOKEN,code);p=(Array.isArray(matches)?matches:[]).find(x=>barcodeNorm(x.Barcode)===code||barcodeNorm(x.KodeProduk)===code)||null;if(p)p=await call('getProductDetail',TOKEN,p.ID);perf.serverLookupMs+=barcodePerfNow_()-fallbackStart;perf.lookupPath='legacy_fallback_search_detail';}
-    catch(fallbackError){console.warn('[Barcode Fast Lookup] Fallback legacy gagal:',fallbackError&&fallbackError.message||fallbackError);}
-   }
+   if(!perf.serverLookupMs)perf.serverLookupMs=barcodePerfNow_()-serverStart;
+   perf.bridgeTrace=lookupError&&lookupError.bridgeTrace||perf.bridgeTrace||null;perf.gatewayTrace=lookupError&&lookupError.gatewayTrace||perf.gatewayTrace||null;
+   const msg=String(lookupError&&lookupError.message||lookupError||'');
+   const code=String(lookupError&&lookupError.code||'');
+   const unavailable=/getBarcodeProductFast/i.test(msg)&&/(tidak tersedia|not available|not found|undefined|unknown function)/i.test(msg);
+   if(unavailable){perf.result='lookup_endpoint_unavailable';perf.failureCode='ENDPOINT_UNAVAILABLE';}
+   else if(code==='GATEWAY_TIMEOUT'||/gateway.*tidak memberikan respons|timeout|timed out/i.test(msg)){perf.result='lookup_timeout';perf.failureCode='LOOKUP_TIMEOUT';}
+   else if(code==='NETWORK_ERROR'||/koneksi internet tidak tersedia|perangkat sedang offline/i.test(msg)){perf.result='network_error';perf.failureCode='NETWORK_ERROR';}
+   else if(code==='INVALID_LOOKUP_RESPONSE'){perf.result='invalid_backend_response';perf.failureCode='INVALID_BACKEND_RESPONSE';}
+   else {perf.result='backend_error';perf.failureCode=code||'BACKEND_ERROR';}
+   perf.lookupPath='indexed_server_single_request_error';
+   perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
+   const userMessage=perf.result==='lookup_timeout'?'Pencarian produk belum mendapat respons dari server. Status produk belum dapat dipastikan. Periksa koneksi lalu coba pencarian kembali; jangan anggap produk tidak terdaftar.':perf.result==='network_error'?'Koneksi ke server tidak tersedia. Status produk belum dapat dipastikan.':perf.result==='lookup_endpoint_unavailable'?'Fitur pencarian barcode cepat belum tersedia pada deployment backend. Perbarui backend dan deploy versi terbaru.':perf.result==='invalid_backend_response'?'Server mengirim respons pencarian yang tidak valid. Produk belum dapat dipastikan.':'Terjadi kesalahan saat mencari produk pada server. Status produk belum dapat dipastikan.';
+   if($('kResults'))$('kResults').innerHTML='<span class="error">'+esc(userMessage)+'</span>';
+   setKasirBarcodeWarning_(userMessage,'error');barcodeBeep(false);barcodePill('Pencarian produk belum dapat dipastikan',false);return null;
   }
  }else if(p){perf.lookupPath='local_offline_cache';}
+ else if(!TOKEN||!navigator.onLine||OFFLINE_MODE){
+  perf.result='offline_lookup_unavailable';perf.failureCode='OFFLINE_CACHE_MISS';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
+  const offlineMessage='Koneksi server tidak tersedia dan barcode tidak ditemukan pada cache lokal. Status produk belum dapat dipastikan.';
+  if($('kResults'))$('kResults').innerHTML='<span class="error">'+esc(offlineMessage)+'</span>';
+  setKasirBarcodeWarning_(offlineMessage,'error');barcodeBeep(false);return null;
+ }
  try{
   const validationStart=barcodePerfNow_();
-  if(!p){perf.result='product_not_found';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if($('kResults'))$('kResults').innerHTML='<span class="error">Barcode/kode '+esc(code)+' tidak ditemukan di Master Produk. Data lokal dan server sudah diperiksa.</span>';barcodeBeep(false);barcodePill('Barcode '+code+' tidak ditemukan',false);return null;}
+  if(!p){perf.result='product_not_found';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if($('kResults'))$('kResults').innerHTML='<span class="error">Barcode/kode '+esc(code)+' tidak ditemukan pada Master Produk.</span>';barcodeBeep(false);barcodePill('Barcode '+code+' tidak ditemukan',false);return null;}
   if(Number(p.Stok||0)<=0){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='out_of_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Stok habis untuk '+p.NamaProduk+'. Produk tidak ditambahkan ke keranjang.','error');barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
   if(String(p.JenisObat||'').toLowerCase()==='keras'&&$('kJenisTransaksi')?.value!=='Resep'){
    perf.validationMs=barcodePerfNow_()-validationStart;perf.result='prescription_required';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
