@@ -7440,40 +7440,32 @@ window.addEventListener('message',function(event){
   receiveUsbBtMonitorStatus_(String(data.state||'ready'),String(data.detail||'Input HID dari popup'));
   return;
  }
- if(data.type==='APOTEK_SCANNER_RESULT_STATUS'&&BARCODE_SCAN_MODE==='kasir'){
-  const requestId=String(data.requestId||''),entry=BARCODE_KASIR_REQUESTS.get(requestId);
-  if(!requestId)return;
-  const reply=(stage,success,message,barcode)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message,barcode:barcode||''},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim status ACK barcode:',e)}};
-  if(entry){
-   if(entry.state==='completed')reply('completed',!!entry.success,entry.message,entry.barcode);
-   else reply('processing',true,'Menu Kasir masih memproses barcode. Mohon tunggu…',entry.barcode);
-  }else reply('unknown',false,'Status permintaan tidak tercatat pada sesi Menu Kasir. Periksa keranjang sebelum melanjutkan.', '');
+ if(data.type==='APOTEK_SCANNER_STATUS_PROBE'&&BARCODE_SCAN_MODE==='kasir'){
+  const requestId=String(data.requestId||'');if(!requestId)return;
+  const entry=BARCODE_KASIR_REQUESTS.get(requestId);
+  const ack=(stage,success,message)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message,probe:true},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim status scanner:',e)}};
+  if(!entry){ack('unknown',false,'Status proses tidak tersedia pada sesi Menu Kasir ini. Jangan kirim ulang otomatis; periksa keranjang transaksi terlebih dahulu.');return;}
+  if(entry.status==='completed')ack('completed',entry.success,entry.message);
+  else ack('processing',true,'Menu Kasir masih memproses barcode.');
   return;
  }
  if(data.type==='APOTEK_SCANNER_RESULT'){
-  console.info('[Barcode Bridge] Barcode diterima dari scanner.',{requestId:String(data.requestId||''),mode:BARCODE_SCAN_MODE,origin:event.origin,sourceMatched:event.source===BARCODE_SCANNER_WINDOW,recovery:!!data.recovery});
+  console.info('[Barcode Bridge] Barcode diterima dari scanner.',{requestId:String(data.requestId||''),mode:BARCODE_SCAN_MODE,origin:event.origin,sourceMatched:event.source===BARCODE_SCANNER_WINDOW});
   const code=barcodeNorm(data.barcode),requestId=String(data.requestId||'');
-  if(!code||code.length>128||!requestId||requestId.length>160)return;
-  if(BARCODE_SCAN_MODE==='kasir'){
+  if(!code||code.length>128)return;
+  if(BARCODE_SCAN_MODE==='kasir'&&requestId){
    const ack=(stage,success,message)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim konfirmasi barcode Kasir:',e)}};
    const existing=BARCODE_KASIR_REQUESTS.get(requestId);
-   if(existing){
-    if(existing.state==='completed')ack('completed',!!existing.success,existing.message);
-    else ack('processing',true,'Barcode sudah diterima; proses sebelumnya masih berjalan.');
-    return;
-   }
-   const entry={state:'processing',barcode:code,success:false,message:'Menu Kasir sedang memproses barcode.'};
+   if(existing){ack(existing.status==='completed'?'completed':'processing',existing.success,existing.message||'Barcode sudah diterima; proses sebelumnya sedang berjalan.');return;}
+   const entry={status:'processing',success:false,message:'Barcode diterima aplikasi Kasir. Memeriksa produk…',updatedAt:Date.now()};
    BARCODE_KASIR_REQUESTS.set(requestId,entry);
-   ack('received',true,'Barcode diterima aplikasi Kasir. Memeriksa produk…');
+   ack('received',true,entry.message);
    let task;
    try{task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,cameraSessionElapsedMs:data.cameraSessionElapsedMs,decodeProcessingMs:data.decodeProcessingMs,detectedAt:data.detectedAt,scannerSessionId:BARCODE_SCANNER_SESSION_ID}));}
    catch(error){task=Promise.reject(error)}
-   task.then(result=>{
-    entry.state='completed';entry.success=!!result;entry.message=result?'Produk berhasil diproses dan keranjang diperbarui.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';
-    ack('completed',entry.success,entry.message);
-   }).catch(error=>{
-    entry.state='completed';entry.success=false;entry.message=String(error?.message||error||'Gagal memproses barcode.');ack('completed',false,entry.message);
-   }).finally(()=>{setTimeout(()=>{if(BARCODE_KASIR_REQUESTS.get(requestId)===entry)BARCODE_KASIR_REQUESTS.delete(requestId)},120000)});
+   task.then(result=>{entry.status='completed';entry.success=!!result;entry.message=result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';entry.updatedAt=Date.now();ack('completed',entry.success,entry.message)})
+    .catch(error=>{entry.status='completed';entry.success=false;entry.message=String(error?.message||error||'Gagal memproses barcode.');entry.updatedAt=Date.now();ack('completed',false,entry.message)})
+    .finally(()=>{setTimeout(()=>{if(BARCODE_KASIR_REQUESTS.get(requestId)===entry)BARCODE_KASIR_REQUESTS.delete(requestId)},120000)});
   }else submitUnifiedBarcode(code,'camera-popup',BARCODE_SCAN_MODE);
   return;
  }
