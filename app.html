@@ -7575,7 +7575,7 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
    const code=String(lookupError&&lookupError.code||'');
    const unavailable=/getBarcodeProductFast/i.test(msg)&&/(tidak tersedia|not available|not found|undefined|unknown function)/i.test(msg);
    if(unavailable){perf.result='lookup_endpoint_unavailable';perf.failureCode='ENDPOINT_UNAVAILABLE';}
-   else if(code==='GATEWAY_TIMEOUT'||/gateway.*tidak memberikan respons|timeout|timed out/i.test(msg)){perf.result='lookup_timeout';perf.failureCode='LOOKUP_TIMEOUT';}
+   else if(code==='LOOKUP_TIMEOUT'||code==='GATEWAY_TIMEOUT'||/gateway.*tidak memberikan respons|timeout|timed out/i.test(msg)){perf.result='lookup_timeout';perf.failureCode='LOOKUP_TIMEOUT';}
    else if(code==='NETWORK_ERROR'||/koneksi internet tidak tersedia|perangkat sedang offline/i.test(msg)){perf.result='network_error';perf.failureCode='NETWORK_ERROR';}
    else if(code==='INVALID_LOOKUP_RESPONSE'){perf.result='invalid_backend_response';perf.failureCode='INVALID_BACKEND_RESPONSE';}
    else {perf.result='backend_error';perf.failureCode=code||'BACKEND_ERROR';}
