@@ -7321,8 +7321,35 @@ function pollServerBarcodeQueue_(){
    if(items.length)BARCODE_QUEUE_POLL_DELAY=1800;else BARCODE_QUEUE_POLL_DELAY=6000;
    for(const item of items){
     let ok=false,message='Barcode tidak dapat diproses.';
-    try{const result=await processBarcodeInput(item.barcode,'kasir','server-queue');ok=!!result;message=ok?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';}
-    catch(err){message=String(err&&err.message||err||message)}
+    const barcodeStartedAt=Date.now();
+    try{
+     const result=await processBarcodeInput(item.barcode,'kasir','server-queue');
+     ok=!!result;
+     if(ok)message='Produk berhasil ditambahkan ke keranjang.';
+     else{
+      // Gunakan hasil diagnostik untuk membedakan timeout dari produk yang benar-benar tidak ditemukan.
+      const samples=typeof getBarcodePerformanceSamples_==='function'?getBarcodePerformanceSamples_(10):[];
+      const sample=[...samples].reverse().find(x=>x&&x.source==='server-queue'&&Date.parse(x.at||'')>=barcodeStartedAt-1500);
+      const resultCode=String(sample&&sample.result||'');
+      if(resultCode==='lookup_timeout'||resultCode==='backend_error'&&String(sample&&sample.failureCode||'')==='LOOKUP_TIMEOUT'){
+       message='Pencarian barcode timeout: server belum memberikan respons. Status produk belum dapat dipastikan; barcode tidak ditandai sebagai produk tidak ditemukan.';
+      }else if(resultCode==='network_error'||resultCode==='offline_lookup_unavailable'){
+       message='Koneksi server tidak tersedia. Status produk belum dapat dipastikan; barcode tidak ditandai sebagai produk tidak ditemukan.';
+      }else if(resultCode==='product_not_found'){
+       message='Barcode benar-benar tidak ditemukan pada Master Produk.';
+      }else if(resultCode==='out_of_stock'){
+       message='Produk ditemukan, tetapi stok tersedia habis.';
+      }else if(resultCode==='insufficient_stock'){
+       message='Produk ditemukan, tetapi stok tidak mencukupi untuk kuantitas berikutnya.';
+      }else if(resultCode==='prescription_required'||resultCode==='prescription_number_required'){
+       message='Produk ditemukan, tetapi persyaratan transaksi resep belum terpenuhi.';
+      }else if(resultCode==='invalid_backend_response'||resultCode==='lookup_endpoint_unavailable'){
+       message='Respons layanan pencarian barcode tidak valid atau endpoint belum tersedia. Status produk belum dapat dipastikan.';
+      }else{
+       message='Barcode belum berhasil diproses. Status produk belum dapat dipastikan; periksa diagnostik sebelum menyimpulkan produk tidak ditemukan.';
+      }
+     }
+    }catch(err){message=String(err&&err.message||err||message)}
     try{await call('acknowledgeBarcodeQueue',TOKEN,item.requestId,ok,message,APOTEK_BARCODE_CLIENT_ID);}catch(e){console.warn('[Barcode Queue] Gagal mengirim acknowledgement:',e)}
    }
    BARCODE_QUEUE_POLL_BUSY=false;scheduleBarcodeQueuePoll_(BARCODE_QUEUE_POLL_DELAY);
