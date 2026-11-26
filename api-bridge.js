@@ -1,5 +1,5 @@
-/* APOTEK PWA API Bridge Client v1.8.0 — Late Response Correlation & Request Lifecycle Integrity V3.
- * Corrected unified timeout, bounded late-response ACK lifecycle, and request isolation.
+/* APOTEK PWA API Bridge Client v1.8.1 — Gateway Response Delivery Diagnostics & Transport Recovery C3.2.
+ * Adds response-delivery telemetry, robust duplicate ACK correlation, and bounded transport diagnostics.
  * Fast barcode lookup remains read-only and is never automatically retried.
  * Diagnostics contain no credentials, request payloads, or barcode values.
  */
@@ -90,7 +90,13 @@
     frame.tabIndex = -1;
     frame.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
     document.body.appendChild(frame);
-    frame.addEventListener("load", () => record("FRAME_LOAD", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), connected:frame.isConnected, visibility:document.visibilityState }));
+    frame._apotekTransport = { createdAt:Date.now(), loadCount:0, lastLoadAt:null };
+    frame.addEventListener("load", () => {
+      const t=frame._apotekTransport||{loadCount:0};
+      t.loadCount=(Number(t.loadCount)||0)+1; t.lastLoadAt=Date.now();
+      frame._apotekTransport=t;
+      record("FRAME_LOAD", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), loadCount:t.loadCount, sinceFrameCreatedMs:t.lastLoadAt-t.createdAt, connected:frame.isConnected, visibility:document.visibilityState });
+    });
     record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), visibility:document.visibilityState });
     return frame;
   }
@@ -144,11 +150,13 @@
     crypto.getRandomValues(b);
     return Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
   }
-  function acknowledgeResponse(event, id, duplicate) {
+  function acknowledgeResponse(event, id, duplicate, deliveryTrace) {
     try {
       if (!event.source || typeof event.source.postMessage !== "function") throw new Error("Response source unavailable");
-      event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id }, event.origin);
-      record(duplicate ? "MESSAGE_DUPLICATE_ACKED" : "MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin });
+      const ackAt=Date.now();
+      const delivery=deliveryTrace&&typeof deliveryTrace==="object"?deliveryTrace:{};
+      event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id, ackVersion:"1.1", clientAckAt:ackAt, deliveryAttempt:Number(delivery.attempt)||null, deliveryElapsedMs:Number(delivery.elapsedMs)||null }, event.origin);
+      record(duplicate ? "MESSAGE_DUPLICATE_ACKED" : "MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin, deliveryAttempt:Number(delivery.attempt)||null, deliveryElapsedMs:Number(delivery.elapsedMs)||null, clientAckAt:ackAt });
       return true;
     } catch (ackError) {
       record("MESSAGE_ACK_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160) });
@@ -160,8 +168,14 @@
     const p = pending.get(id);
     if (!p) {
       const done = completed.get(id);
-      if (done && done.expiresAt > Date.now() && done.source === event.source && trustedGoogleResponseOrigin(event.origin)) {
-        acknowledgeResponse(event, id, true);
+      if (done && done.expiresAt > Date.now() && trustedGoogleResponseOrigin(event.origin)) {
+        // HtmlService can deliver a duplicate through a different nested sandbox
+        // WindowProxy. The unguessable request ID plus strict Google origin check
+        // is the correlation boundary; requiring identical event.source can leave
+        // the response page retrying until its delivery window expires.
+        const sourceChanged=done.source!==event.source;
+        acknowledgeResponse(event, id, true, data.deliveryTrace);
+        if (sourceChanged) record("MESSAGE_DUPLICATE_SOURCE_CHANGED_ACKED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
         if (done.origin !== event.origin) record("MESSAGE_DUPLICATE_ORIGIN_CHANGED", { requestIdPrefix:id.slice(0,12), previousOrigin:done.origin, origin:event.origin });
         return;
       }
@@ -170,7 +184,7 @@
         // A timed-out operation is terminal for the UI. ACK only to stop gateway
         // redelivery; never resolve the original Promise or apply its payload.
         const frameConnectedBeforeCleanup = !!(late.frame && late.frame.isConnected);
-        const acked = acknowledgeResponse(event, id, true);
+        const acked = acknowledgeResponse(event, id, true, data.deliveryTrace);
         late.responseObservedAt = Date.now();
         late.acknowledged = !!acked;
         lateRequests.delete(id);
@@ -196,14 +210,16 @@
       record("MESSAGE_SOURCE_NESTED_FRAME_ACCEPTED", { requestIdPrefix:id.slice(0,12), origin:event.origin });
     }
     if (data.result && data.result.code === "GATEWAY_REQUEST_IN_PROGRESS") {
-      acknowledgeResponse(event, id, false);
+      acknowledgeResponse(event, id, false, data.deliveryTrace);
       record("MESSAGE_REQUEST_IN_PROGRESS", { requestIdPrefix:id.slice(0,12), method:p.method, retryAfterMs:Number(data.result.retryAfterMs)||2000, elapsedMs:Date.now()-p.startedAt });
       if (p.retryTimer) clearTimeout(p.retryTimer);
       const delay = Math.max(1000, Math.min(5000, Number(data.result.retryAfterMs)||2000));
       p.retryTimer = setTimeout(() => { if (pending.has(id) && p.submitAttempt && p.attempts < 7) p.submitAttempt(true); }, delay);
       return;
     }
-    const responseAcked = acknowledgeResponse(event, id, false);
+    const deliveryTrace=data.deliveryTrace&&typeof data.deliveryTrace==="object"?data.deliveryTrace:null;
+    record("MESSAGE_DELIVERY_OBSERVED", { requestIdPrefix:id.slice(0,12), method:p.method, deliveryAttempt:deliveryTrace&&Number(deliveryTrace.attempt)||null, deliveryElapsedMs:deliveryTrace&&Number(deliveryTrace.elapsedMs)||null, responseOrigin:event.origin, nestedFrame:!sourceMatchesFrame });
+    const responseAcked = acknowledgeResponse(event, id, false, deliveryTrace);
     p.responseObservedAt = Date.now();
     p.responseAcked = !!responseAcked;
     clearTimeout(p.timer);
@@ -219,7 +235,7 @@
       if (p.frame && p.frame.isConnected) p.frame.remove();
     }, COMPLETED_ACK_TTL_MS);
     const responseAt=Date.now();
-    const bridgeTrace={requestIdPrefix:id.slice(0,12),method:p.method,elapsedMs:responseAt-p.startedAt,attempts:Number(p.attempts)||0,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:responseAt,lastMessageStage:p.lastMessageStage||"MESSAGE_RECEIVED",nestedFrameAccepted:!sourceMatchesFrame,gatewayTrace:data.result&&data.result.gatewayTrace||data.result&&data.result.data&&data.result.data._gatewayTrace||null};
+    const bridgeTrace={requestIdPrefix:id.slice(0,12),method:p.method,elapsedMs:responseAt-p.startedAt,attempts:Number(p.attempts)||0,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:responseAt,lastMessageStage:p.lastMessageStage||"MESSAGE_RECEIVED",nestedFrameAccepted:!sourceMatchesFrame,gatewayTrace:data.result&&data.result.gatewayTrace||data.result&&data.result.data&&data.result.data._gatewayTrace||null,transportTrace:data.transportTrace||null,deliveryTrace:deliveryTrace||null,frameLoadCount:Number(p.frame&&p.frame._apotekTransport&&p.frame._apotekTransport.loadCount)||0};
     if (!data.result || data.result.ok !== true) {
       const apiCode=String(data.result && data.result.code || "BACKEND_ERROR").slice(0,80);
       record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:apiCode, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, origin:event.origin });
@@ -282,7 +298,8 @@
         lifecycleTransition(id, "TIMED_OUT", {method:String(method),timeoutMs:timeoutMs});
         const elapsedMs=Date.now()-startedAt;
         const trace={requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:elapsedMs,attempts:attempts,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:null,lastMessageStage:p.lastMessageStage||null,visibility:document.visibilityState};
-        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, pendingCount:pending.size });
+        const frameTransport=frame&&frame._apotekTransport||{};
+        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, frameLoadCount:Number(frameTransport.loadCount)||0, frameAgeMs:Date.now()-Number(frameTransport.createdAt||startedAt), lastFrameLoadAgeMs:frameTransport.lastLoadAt?Date.now()-frameTransport.lastLoadAt:null, pendingCount:pending.size });
         record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:elapsedMs, timeoutMs:timeoutMs, lastMessageStage:p.lastMessageStage || null, lateGraceMs:LOOKUP_FRAME_GRACE_MS });
         // Keep the named response frame alive briefly so a delayed HtmlService
         // response can be ACKed. Its data is deliberately discarded after timeout.
@@ -435,7 +452,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.8.0-resilient-gateway-correlation-v3",
+    version:"1.8.1-gateway-response-delivery-c3.2",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -444,6 +461,7 @@
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
+    getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_ACK|MESSAGE_DUPLICATE|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-60); },
     getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12)),lifecycleCount:lifecycle.size,lifecycleStates:this.getLifecycleSummary().stateCounts}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
@@ -470,6 +488,6 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
