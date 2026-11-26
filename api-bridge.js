@@ -42,6 +42,12 @@
   const COMPLETED_ACK_TTL_MS = 12000;
   const MAX_PENDING_REQUESTS = 8;
   const MAX_LATE_RESPONSE_WATCHES = 8;
+  // A small pool reuses only idle, fully-reset iframes. One iframe is never
+  // shared by concurrent requests; overflow uses a transient dedicated frame.
+  const GATEWAY_FRAME_POOL_MAX = 4;
+  const GATEWAY_FRAME_POOL_WARM = 2;
+  const GATEWAY_FRAME_READY_TIMEOUT_MS = 12000;
+  const gatewayFramePool = [];
   const LOOKUP_SOFT_TIMEOUT_MS = 12000;
   const LOOKUP_HARD_TIMEOUT_MS = 30000;
   const LOOKUP_FRAME_GRACE_MS = 12000;
@@ -80,25 +86,100 @@
   function validEndpoint(v) {
     return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(v);
   }
-  // Each in-flight request owns a dedicated iframe. Reusing one iframe lets
-  // concurrent form submissions navigate over each other's response documents.
-  function createFrame(requestId) {
+  // Frames are preloaded at about:blank, leased exclusively, and reset only
+  // after ACK duplicate protection has expired. A timeout frame stays quarantined
+  // until its late-response watch ends. This prevents cross-request navigation.
+  function makeFrameReadyPromise(frame) {
+    let resolveReady;
+    frame._apotekReadyPromise = new Promise(resolve => { resolveReady = resolve; });
+    frame._apotekResolveReady = resolveReady;
+  }
+  function createFrame(requestId, pooled) {
     const frame = document.createElement("iframe");
-    frame.name = "apotek_pwa_gateway_" + requestId;
+    frame.name = "apotek_pwa_gateway_frame_" + makeId().slice(0,24);
     frame.title = "APOTEK API Gateway";
     frame.setAttribute("aria-hidden", "true");
     frame.tabIndex = -1;
     frame.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
-    document.body.appendChild(frame);
-    frame._apotekTransport = { createdAt:Date.now(), loadCount:0, lastLoadAt:null };
+    frame._apotekPooled = pooled !== false;
+    frame._apotekTransport = { requestId:requestId||"", createdAt:Date.now(), leaseAt:Date.now(), loadCount:0, lastLoadAt:null, phase:"WAITING_INITIAL_BLANK", busy:!!requestId, ready:false };
+    makeFrameReadyPromise(frame);
     frame.addEventListener("load", () => {
-      const t=frame._apotekTransport||{loadCount:0};
-      t.loadCount=(Number(t.loadCount)||0)+1; t.lastLoadAt=Date.now();
-      frame._apotekTransport=t;
-      record("FRAME_LOAD", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), loadCount:t.loadCount, sinceFrameCreatedMs:t.lastLoadAt-t.createdAt, connected:frame.isConnected, visibility:document.visibilityState });
+      const t=frame._apotekTransport||{};
+      t.loadCount=(Number(t.loadCount)||0)+1;
+      t.lastLoadAt=Date.now();
+      if (t.phase === "WAITING_INITIAL_BLANK" || t.phase === "WAITING_RESET_BLANK") {
+        t.ready=true;
+        t.phase=t.busy?"RESERVED":"IDLE";
+        record(t.phase === "IDLE" ? "FRAME_POOL_READY" : "FRAME_INITIAL_READY", {
+          frameName:frame.name, requestIdPrefix:String(t.requestId||"").slice(0,12),
+          loadCount:t.loadCount, sinceFrameCreatedMs:t.lastLoadAt-t.createdAt,
+          sinceLeaseMs:t.lastLoadAt-t.leaseAt, pooled:!!frame._apotekPooled,
+          connected:frame.isConnected, visibility:document.visibilityState
+        });
+        if (frame._apotekResolveReady) frame._apotekResolveReady(frame);
+        return;
+      }
+      if (t.phase === "DISPATCHED") {
+        t.phase="RESPONSE_DOCUMENT_LOADED";
+        record("FRAME_RESPONSE_LOAD", { frameName:frame.name, requestIdPrefix:String(t.requestId||"").slice(0,12), loadCount:t.loadCount, sinceDispatchMs:t.lastLoadAt-(t.dispatchAt||t.leaseAt), connected:frame.isConnected, visibility:document.visibilityState });
+      } else {
+        record("FRAME_LOAD_UNEXPECTED", {frameName:frame.name,requestIdPrefix:String(t.requestId||"").slice(0,12),phase:String(t.phase||"unknown"),loadCount:t.loadCount});
+      }
     });
-    record("FRAME_READY", { frameName:frame.name, requestIdPrefix:requestId.slice(0,12), visibility:document.visibilityState });
+    document.body.appendChild(frame);
+    frame.src="about:blank";
+    record("FRAME_CREATED", {frameName:frame.name,requestIdPrefix:String(requestId||"").slice(0,12),pooled:!!frame._apotekPooled,poolSize:gatewayFramePool.length,visibility:document.visibilityState});
     return frame;
+  }
+  function acquireFrame(requestId) {
+    // Drop detached frames so stale DOM references cannot permanently consume pool capacity.
+    for (let i=gatewayFramePool.length-1;i>=0;i--) {
+      if (!gatewayFramePool[i] || !gatewayFramePool[i].isConnected) gatewayFramePool.splice(i,1);
+    }
+    let frame=gatewayFramePool.find(f => f.isConnected && !f._apotekTransport.busy && f._apotekTransport.ready && f._apotekTransport.phase === "IDLE");
+    if (frame) {
+      const t=frame._apotekTransport;
+      t.requestId=requestId; t.busy=true; t.ready=true; t.phase="RESERVED";
+      t.leaseAt=Date.now(); t.dispatchAt=null; t.lastLoadAt=null; t.loadCount=0;
+      makeFrameReadyPromise(frame);
+      // A reused blank frame is already ready; resolve without waiting for another load.
+      if (frame._apotekResolveReady) frame._apotekResolveReady(frame);
+      record("FRAME_POOL_REUSED", {frameName:frame.name,requestIdPrefix:requestId.slice(0,12),poolSize:gatewayFramePool.length});
+      return frame;
+    }
+    const canPool=gatewayFramePool.length < GATEWAY_FRAME_POOL_MAX;
+    frame=createFrame(requestId,canPool);
+    if (canPool) gatewayFramePool.push(frame);
+    else record("FRAME_POOL_OVERFLOW_TRANSIENT", {requestIdPrefix:requestId.slice(0,12),poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX});
+    return frame;
+  }
+  function resetOrRemoveFrame(frame, requestId, reason) {
+    if (!frame) return;
+    const t=frame._apotekTransport||{};
+    if (!frame.isConnected) return;
+    if (!frame._apotekPooled) {
+      frame.remove();
+      record("FRAME_TRANSIENT_REMOVED", {requestIdPrefix:String(requestId||t.requestId||"").slice(0,12),reason:String(reason||"released")});
+      return;
+    }
+    t.requestId=""; t.busy=false; t.ready=false; t.phase="WAITING_RESET_BLANK"; t.dispatchAt=null; t.leaseAt=Date.now();
+    makeFrameReadyPromise(frame);
+    try {
+      frame.src="about:blank";
+      record("FRAME_POOL_RESET", {frameName:frame.name,requestIdPrefix:String(requestId||"").slice(0,12),reason:String(reason||"released")});
+    } catch (error) {
+      const i=gatewayFramePool.indexOf(frame); if(i>=0)gatewayFramePool.splice(i,1);
+      frame.remove();
+      record("FRAME_POOL_RESET_FAILED", {requestIdPrefix:String(requestId||"").slice(0,12),error:String(error&&error.message||error).slice(0,120)});
+    }
+  }
+  // Warm two blank frames. They are not used until the browser confirms their
+  // initial about:blank load; requests can still create additional pooled frames.
+  for (let i=0;i<GATEWAY_FRAME_POOL_WARM;i++) {
+    const warm=createFrame("",true);
+    warm._apotekTransport.busy=false;
+    gatewayFramePool.push(warm);
   }
   const REFRESH_STORAGE_KEY = "apotek_pwa_refresh_v12_persistent";
   const REFRESH_PENDING_KEY = "apotek_pwa_refresh_pending_v12_persistent";
@@ -189,7 +270,7 @@
         late.acknowledged = !!acked;
         lateRequests.delete(id);
         clearTimeout(late.cleanupTimer);
-        if (late.frame && late.frame.isConnected) late.frame.remove();
+        resetOrRemoveFrame(late.frame, id, "late_response_acknowledged");
         record("LIFECYCLE_LATE_RESPONSE_RECONCILED", {requestIdPrefix:id.slice(0,12),terminalState:"TIMED_OUT",payloadApplied:false});
         record("MESSAGE_LATE_AFTER_TIMEOUT_ACKED", {requestIdPrefix:id.slice(0,12),method:late.method,elapsedMs:Date.now()-late.startedAt,origin:event.origin,acknowledged:!!acked,frameConnectedBeforeCleanup,payloadApplied:false});
         return;
@@ -232,7 +313,7 @@
     completed.set(id, done);
     setTimeout(() => {
       if (completed.get(id) === done) completed.delete(id);
-      if (p.frame && p.frame.isConnected) p.frame.remove();
+      resetOrRemoveFrame(p.frame, id, "completed_ack_window_expired");
     }, COMPLETED_ACK_TTL_MS);
     const responseAt=Date.now();
     const bridgeTrace={requestIdPrefix:id.slice(0,12),method:p.method,elapsedMs:responseAt-p.startedAt,attempts:Number(p.attempts)||0,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:responseAt,lastMessageStage:p.lastMessageStage||"MESSAGE_RECEIVED",nestedFrameAccepted:!sourceMatchesFrame,gatewayTrace:data.result&&data.result.gatewayTrace||data.result&&data.result.data&&data.result.data._gatewayTrace||null,transportTrace:data.transportTrace||null,deliveryTrace:deliveryTrace||null,frameLoadCount:Number(p.frame&&p.frame._apotekTransport&&p.frame._apotekTransport.loadCount)||0};
@@ -283,7 +364,7 @@
     }
     const id = requestIdOverride || makeId();
     if (!/^[A-Za-z0-9_-]{16,100}$/.test(String(id))) return Promise.reject(new Error("Request ID tidak valid."));
-    const frame = createFrame(id);
+    const frame = acquireFrame(id);
     const safeRetryEnabled = !isFastBarcodeLookup; // Lookup is read-only; avoid queue amplification.
     const timeoutMs=isFastBarcodeLookup?LOOKUP_HARD_TIMEOUT_MS:GENERAL_REQUEST_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
@@ -299,7 +380,7 @@
         const elapsedMs=Date.now()-startedAt;
         const trace={requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:elapsedMs,attempts:attempts,firstSubmitAt:p.firstSubmitAt||null,lastSubmitAt:p.lastSubmitAt||null,responseAt:null,lastMessageStage:p.lastMessageStage||null,visibility:document.visibilityState};
         const frameTransport=frame&&frame._apotekTransport||{};
-        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, frameLoadCount:Number(frameTransport.loadCount)||0, frameAgeMs:Date.now()-Number(frameTransport.createdAt||startedAt), lastFrameLoadAgeMs:frameTransport.lastLoadAt?Date.now()-frameTransport.lastLoadAt:null, pendingCount:pending.size });
+        record("REQUEST_TIMEOUT_CONTEXT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), visibility:document.visibilityState, online:navigator.onLine, frameConnectedBeforeCleanup, frameLoadCount:Number(frameTransport.loadCount)||0, frameAgeMs:Date.now()-Number(frameTransport.createdAt||startedAt), lastFrameLoadAgeMs:frameTransport.lastLoadAt?Date.now()-frameTransport.lastLoadAt:null, pendingCount:pending.size, framePhase:frameTransport.phase||null, frameReady:!!frameTransport.ready, dispatchAt:frameTransport.dispatchAt||null });
         record("REQUEST_TIMEOUT", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempts, elapsedMs:elapsedMs, timeoutMs:timeoutMs, lastMessageStage:p.lastMessageStage || null, lateGraceMs:LOOKUP_FRAME_GRACE_MS });
         // Keep the named response frame alive briefly so a delayed HtmlService
         // response can be ACKed. Its data is deliberately discarded after timeout.
@@ -307,14 +388,14 @@
         if (lateRequests.size >= MAX_LATE_RESPONSE_WATCHES) {
           const oldestId = lateRequests.keys().next().value;
           const oldest = lateRequests.get(oldestId);
-          if (oldest) { clearTimeout(oldest.cleanupTimer); if (oldest.frame && oldest.frame.isConnected) oldest.frame.remove(); }
+          if (oldest) { clearTimeout(oldest.cleanupTimer); resetOrRemoveFrame(oldest.frame, oldestId, "late_watch_evicted"); }
           lateRequests.delete(oldestId);
           record("LATE_RESPONSE_WATCH_EVICTED", {requestIdPrefix:String(oldestId).slice(0,12),maxLateWatches:MAX_LATE_RESPONSE_WATCHES});
         }
         const late = {method:String(method),startedAt,frame,expiresAt:Date.now()+LOOKUP_FRAME_GRACE_MS,cleanupTimer:null};
         late.cleanupTimer = setTimeout(() => {
           if (lateRequests.get(id) === late) lateRequests.delete(id);
-          if (frame.isConnected) frame.remove();
+          resetOrRemoveFrame(frame, id, "late_response_grace_expired");
           record("LATE_RESPONSE_GRACE_EXPIRED", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),graceMs:LOOKUP_FRAME_GRACE_MS});
         }, LOOKUP_FRAME_GRACE_MS);
         lateRequests.set(id, late);
@@ -326,12 +407,12 @@
       }, LOOKUP_SOFT_WARNING_MS) : null;
       const p = { resolve, reject, timer, softTimer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
       pending.set(id, p);
-      lifecycleTransition(id, "SUBMITTED", {method:String(method)});
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
         attempts++;
         p.attempts=attempts;
         const submitAt=Date.now();if(!p.firstSubmitAt)p.firstSubmitAt=submitAt;p.lastSubmitAt=submitAt;
+        const transport=frame._apotekTransport||{};transport.phase="DISPATCHED";transport.dispatchAt=submitAt;
         if (attempts > 1) record("LIFECYCLE_RESUBMIT_SAME_ID", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),attempt:attempts});
         record(isRetry ? "REQUEST_RETRY_SUBMIT" : "REQUEST_SUBMIT_START", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts, frameName:frame.name, endpointHost:(new URL(endpoint)).host, visibility:document.visibilityState });
         const form = document.createElement("form");
@@ -356,7 +437,8 @@
             retryTimer = setTimeout(() => { if (pending.has(id)) submitAttempt(true); }, 1200 * attempts);
             p.retryTimer = retryTimer;
           } else {
-            clearTimeout(timer); if (softTimer) clearTimeout(softTimer); pending.delete(id); if (frame.isConnected) frame.remove();
+            clearTimeout(timer); if (softTimer) clearTimeout(softTimer); pending.delete(id);
+            resetOrRemoveFrame(frame,id,"submit_failed");
             lifecycleTransition(id, "FAILED", {method:String(method),reason:"submit_failed"});
             record("REQUEST_SUBMIT_FAILED", { requestIdPrefix:id.slice(0,12), error:String(error && error.message || error).slice(0,180) });
             reject(error);
@@ -364,18 +446,31 @@
           return;
         }
         setTimeout(() => form.remove(), 1000);
-        if (safeRetryEnabled && attempts < 2) {
-          // Allow normal mobile HtmlService delivery to complete before retrying.
-          // A retry reuses the exact requestId and arguments; backend idempotency
-          // or lifecycle replay remains the final duplicate-execution safeguard.
-          const delay = 25000;
-          if (p.retryTimer) clearTimeout(p.retryTimer);
-          retryTimer = setTimeout(() => { if (pending.has(id) && attempts < 2) submitAttempt(true); }, delay);
-          p.retryTimer = retryTimer;
-        }
       }
       p.submitAttempt = submitAttempt;
-      submitAttempt(false);
+      const frameReadyTimer=setTimeout(() => {
+        if (!pending.has(id)) return;
+        if (p.retryTimer) clearTimeout(p.retryTimer);
+        clearTimeout(timer); if (softTimer) clearTimeout(softTimer);
+        pending.delete(id);
+        lifecycleTransition(id, "FAILED", {method:String(method),reason:"frame_initialization_timeout"});
+        record("FRAME_INITIAL_READY_TIMEOUT", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),readyTimeoutMs:GATEWAY_FRAME_READY_TIMEOUT_MS,frameConnected:!!frame.isConnected,phase:frame._apotekTransport&&frame._apotekTransport.phase});
+        resetOrRemoveFrame(frame,id,"frame_initialization_timeout");
+        const e=new Error("Gateway belum siap menerima permintaan. Silakan coba kembali.");e.code="GATEWAY_FRAME_NOT_READY";reject(e);
+      }, GATEWAY_FRAME_READY_TIMEOUT_MS);
+      frame._apotekReadyPromise.then(() => {
+        clearTimeout(frameReadyTimer);
+        if (!pending.has(id)) return;
+        const t=frame._apotekTransport||{};
+        if (!t.ready || !frame.isConnected) {
+          record("FRAME_READY_CHECK_FAILED", {requestIdPrefix:id.slice(0,12),frameConnected:!!frame.isConnected,phase:t.phase||null});
+          return;
+        }
+        t.phase="DISPATCHED"; t.dispatchAt=Date.now();
+        lifecycleTransition(id, "SUBMITTED", {method:String(method),frameReady:true});
+        record("REQUEST_DISPATCH_READY", {requestIdPrefix:id.slice(0,12),method:String(method).slice(0,60),frameName:frame.name,frameReadyWaitMs:Date.now()-Number(t.leaseAt||startedAt),pooled:!!frame._apotekPooled});
+        submitAttempt(false);
+      });
     });
   }
 
@@ -452,7 +547,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.8.1-gateway-response-delivery-c3.2",
+    version:"1.9.0-gateway-iframe-pool-c3.3",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -461,7 +556,8 @@
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
-    getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_ACK|MESSAGE_DUPLICATE|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-60); },
+    getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_ACK|MESSAGE_DUPLICATE|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-100); },
+    getFramePoolSummary() { return {poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX,warmTarget:GATEWAY_FRAME_POOL_WARM,frames:gatewayFramePool.map(f=>({name:f.name,connected:!!f.isConnected,busy:!!(f._apotekTransport&&f._apotekTransport.busy),ready:!!(f._apotekTransport&&f._apotekTransport.ready),phase:f._apotekTransport&&f._apotekTransport.phase,loadCount:f._apotekTransport&&f._apotekTransport.loadCount}))}; },
     getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12)),lifecycleCount:lifecycle.size,lifecycleStates:this.getLifecycleSummary().stateCounts}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
@@ -488,6 +584,6 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), frames:() => bridge.getFramePoolSummary(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
 })();
