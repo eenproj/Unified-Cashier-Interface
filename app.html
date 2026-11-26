@@ -7594,7 +7594,18 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
  }
  try{
   const validationStart=barcodePerfNow_();
-  if(!p){perf.result='product_not_found';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if($('kResults'))$('kResults').innerHTML='<span class="error">Barcode/kode '+esc(code)+' tidak ditemukan pada Master Produk.</span>';barcodeBeep(false);barcodePill('Barcode '+code+' tidak ditemukan',false);return null;}
+  if(!p){
+   perf.result='product_not_found';
+   perf.totalClientMs=barcodePerfNow_()-started;
+   recordBarcodePerf_(perf);
+   const notFoundMessage='Barcode/kode '+code+' tidak ditemukan pada Master Produk.';
+   if($('kResults'))$('kResults').innerHTML='<span class="error">'+esc(notFoundMessage)+'</span>';
+   // Finalize the kasir warning: do not leave the initial "processing" state visible.
+   if(mode==='kasir')setKasirBarcodeWarning_(notFoundMessage,'error');
+   barcodeBeep(false);
+   barcodePill('Barcode '+code+' tidak ditemukan',false);
+   return null;
+ }
   if(Number(p.Stok||0)<=0){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='out_of_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Stok habis untuk '+p.NamaProduk+'. Produk tidak ditambahkan ke keranjang.','error');barcodeBeep(false);barcodePill('Stok habis: '+p.NamaProduk,false);customAlert('Stok habis untuk '+p.NamaProduk+'.');return null}
   if(String(p.JenisObat||'').toLowerCase()==='keras'&&$('kJenisTransaksi')?.value!=='Resep'){
    perf.validationMs=barcodePerfNow_()-validationStart;perf.result='prescription_required';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
@@ -7603,7 +7614,7 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
   }
   if($('kJenisTransaksi')?.value==='Resep'&&!String($('kNoResep')?.value||'').trim()){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='prescription_number_required';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);setKasirBarcodeWarning_('Nomor resep wajib diisi sebelum produk ditambahkan ke keranjang.','warning');customAlert('Nomor resep wajib diisi sebelum memindai obat untuk transaksi resep.');$('kNoResep')?.focus();return null}
   const existing=CART.find(x=>String(x.ProdukID)===String(p.ID));
-  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert('Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.');return null}
+  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);const stockMessage='Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.';if(mode==='kasir')setKasirBarcodeWarning_(stockMessage,'error');barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert(stockMessage);return null}
   perf.validationMs=barcodePerfNow_()-validationStart;
   if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
