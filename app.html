@@ -4501,8 +4501,11 @@ let _activeCashierDialogBridge_=null;
 function cashierDialogId_(){return 'dlg_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10)}
 function syncCashierDialogToScanner_(){
  const d=_activeCashierDialogBridge_;
- if(!d||!BARCODE_SCANNER_WINDOW||!BARCODE_SCANNER_ORIGIN||BARCODE_SCAN_MODE!=='kasir')return false;
- try{BARCODE_SCANNER_WINDOW.postMessage({type:'APOTEK_CASHIER_DIALOG_SYNC',nonce:BARCODE_SCANNER_NONCE,dialog:{id:d.id,title:d.title,message:d.message,kind:d.kind,mode:d.mode,confirmText:d.confirmText,cancelText:d.cancelText,confirmClass:d.confirmClass}},BARCODE_SCANNER_ORIGIN);return true}catch(e){console.warn('[Scanner Dialog Bridge] Gagal menyinkronkan dialog:',e);return false}
+ if(!BARCODE_SCANNER_WINDOW||!BARCODE_SCANNER_ORIGIN||BARCODE_SCAN_MODE!=='kasir')return false;
+ // Always send an explicit empty state when no dialog is active. This clears a stale
+ // mirror on the scanner after a delayed/previous close event or mobile tab restore.
+ const dialog=d?{id:d.id,title:d.title,message:d.message,kind:d.kind,mode:d.mode,confirmText:d.confirmText,cancelText:d.cancelText,confirmClass:d.confirmClass}:null;
+ try{BARCODE_SCANNER_WINDOW.postMessage({type:'APOTEK_CASHIER_DIALOG_SYNC',nonce:BARCODE_SCANNER_NONCE,dialog},BARCODE_SCANNER_ORIGIN);return true}catch(e){console.warn('[Scanner Dialog Bridge] Gagal menyinkronkan dialog:',e);return false}
 }
 function closeCashierDialogBridge_(id){
  const active=_activeCashierDialogBridge_;
