@@ -7166,9 +7166,15 @@ const BARCODE_PRODUCT_REQUESTS_SEEN=new Set(), BARCODE_KASIR_REQUESTS=new Map();
 const BARCODE_REQUEST_LEDGER_KEY='apotek_barcode_request_ledger_v2';
 const BARCODE_REQUEST_LEDGER_TTL=24*60*60*1000, BARCODE_REQUEST_LEDGER_LIMIT=200;
 function barcodeLedgerRead_(){try{const v=JSON.parse(sessionStorage.getItem(BARCODE_REQUEST_LEDGER_KEY)||'[]');return Array.isArray(v)?v:[]}catch(e){return []}}
-function barcodeLedgerWrite_(){try{const now=Date.now();const rows=Array.from(BARCODE_KASIR_REQUESTS.entries()).map(([requestId,e])=>({requestId,status:e.status,success:!!e.success,message:String(e.message||'').slice(0,500),outcome:e.outcome&&typeof e.outcome==='object'?e.outcome:null,updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')})).filter(e=>e.requestId&&now-e.updatedAt<=BARCODE_REQUEST_LEDGER_TTL).sort((a,b)=>a.updatedAt-b.updatedAt).slice(-BARCODE_REQUEST_LEDGER_LIMIT);sessionStorage.setItem(BARCODE_REQUEST_LEDGER_KEY,JSON.stringify(rows))}catch(e){console.warn('[Barcode Lifecycle V2] Ledger tidak dapat disimpan di sessionStorage:',e)}}
-function barcodeLedgerRestore_(){const now=Date.now();for(const e of barcodeLedgerRead_()){if(!e||!e.requestId||now-Number(e.updatedAt||0)>BARCODE_REQUEST_LEDGER_TTL)continue;const restored={status:e.status==='processing'?'interrupted':e.status,success:!!e.success,message:e.status==='processing'?'Halaman Menu Kasir dimuat ulang saat request berlangsung. Hasil transaksi perlu diperiksa; request tidak dijalankan ulang.':String(e.message||''),outcome:e.outcome||null,updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')};BARCODE_KASIR_REQUESTS.set(String(e.requestId),restored)}barcodeLedgerWrite_()}
+function barcodeLedgerWrite_(){try{const now=Date.now();const rows=Array.from(BARCODE_KASIR_REQUESTS.entries()).map(([requestId,e])=>({requestId,status:e.status,success:!!e.success,message:String(e.message||'').slice(0,500),outcome:e.outcome&&typeof e.outcome==='object'?e.outcome:null,commitState:String(e.commitState||'none'),commitAt:Number(e.commitAt)||0,productId:String(e.productId||''),updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')})).filter(e=>e.requestId&&now-e.updatedAt<=BARCODE_REQUEST_LEDGER_TTL).sort((a,b)=>a.updatedAt-b.updatedAt).slice(-BARCODE_REQUEST_LEDGER_LIMIT);sessionStorage.setItem(BARCODE_REQUEST_LEDGER_KEY,JSON.stringify(rows))}catch(e){console.warn('[Barcode Lifecycle V2] Ledger tidak dapat disimpan di sessionStorage:',e)}}
+function barcodeLedgerRestore_(){const now=Date.now();for(const e of barcodeLedgerRead_()){if(!e||!e.requestId||now-Number(e.updatedAt||0)>BARCODE_REQUEST_LEDGER_TTL)continue;const restored={status:e.status==='processing'?'interrupted':e.status,success:!!e.success,message:e.status==='processing'?'Halaman Menu Kasir dimuat ulang saat request berlangsung. Hasil transaksi perlu diperiksa; request tidak dijalankan ulang.':String(e.message||''),outcome:e.outcome||null,commitState:String(e.commitState||'none'),commitAt:Number(e.commitAt)||0,productId:String(e.productId||''),updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')};BARCODE_KASIR_REQUESTS.set(String(e.requestId),restored)}barcodeLedgerWrite_()}
 function barcodeLedgerPut_(requestId,entry){BARCODE_KASIR_REQUESTS.set(String(requestId),entry);barcodeLedgerWrite_();}
+// D3: request-scoped commit journal. Fail-closed across reloads: an intent is never replayed automatically.
+function barcodeCommitJournal_(requestId){const e=BARCODE_KASIR_REQUESTS.get(String(requestId));return e||null;}
+function barcodeCommitClaim_(requestId){if(!requestId)return {ok:true,entry:null};const e=barcodeCommitJournal_(requestId);if(!e)return {ok:false,reason:'REQUEST_NOT_REGISTERED'};if(e.commitState==='intent'||e.commitState==='committed'||e.commitState==='uncertain')return {ok:false,reason:'COMMIT_ALREADY_CLAIMED',entry:e};if(e.status==='interrupted'||e.status==='completed')return {ok:false,reason:'REQUEST_NOT_ACTIVE',entry:e};e.commitState='processing';e.updatedAt=Date.now();barcodeLedgerWrite_();return {ok:true,entry:e};}
+function barcodeCommitIntent_(requestId,productId){if(!requestId)return true;const e=barcodeCommitJournal_(requestId);if(!e||e.commitState!=='processing'||e.status!=='processing')return false;e.commitState='intent';e.productId=String(productId||'');e.commitAt=Date.now();e.updatedAt=Date.now();barcodeLedgerWrite_();return true;}
+function barcodeCommitFinalize_(requestId,state='committed'){if(!requestId)return;const e=barcodeCommitJournal_(requestId);if(!e)return;e.commitState=state;e.commitAt=Number(e.commitAt)||Date.now();e.updatedAt=Date.now();barcodeLedgerWrite_();}
+function barcodeCommitDuplicateOutcome_(requestId){const e=barcodeCommitJournal_(requestId);return {status:'DUPLICATE_SUPPRESSED',success:false,message:e&&e.commitState==='committed'?'Request ini sudah menambahkan produk sebelumnya; penambahan ulang diblokir.':'Request ini sudah memiliki proses commit atau statusnya belum pasti. Tidak dilakukan penambahan ulang.',commitState:e&&e.commitState||'unknown'};}
 barcodeLedgerRestore_();
 let APOTEK_DIRECT_CAMERA_QR=null,APOTEK_DIRECT_CAMERA_MODE='kasir',APOTEK_DIRECT_CAMERA_FACING='environment',APOTEK_DIRECT_CAMERA_ACTIVE=false,APOTEK_DIRECT_CAMERA_LOADING=null,APOTEK_DIRECT_CAMERA_LAST_CODE='',APOTEK_DIRECT_CAMERA_LAST_AT=0;
 const BARCODE_SAMPLE_CODES=['8999999000016','8999999000023','1234567890128'];
@@ -7483,8 +7489,8 @@ window.addEventListener('message',function(event){
   const ack=(stage,success,message,outcome)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message,outcome:outcome||null,probe:true},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim status scanner:',e)}};
   if(!entry){ack('unknown',false,'Status request tidak ditemukan dalam riwayat sesi ini. Jangan kirim ulang otomatis; periksa keranjang dan riwayat transaksi terlebih dahulu.');return;}
   if(entry.status==='completed')ack('completed',entry.success,entry.message,entry.outcome);
-  else if(entry.status==='processing')ack('processing',true,'Menu Kasir masih memproses barcode. Tidak ada pengiriman ulang.');
-  else ack('unknown',false,entry.message||'Pemrosesan terputus ketika halaman Menu Kasir dimuat ulang. Periksa keranjang dan riwayat transaksi; jangan kirim ulang otomatis.');
+  else if(entry.status==='processing')ack('processing',true,'Menu Kasir masih memproses barcode. Tidak ada pengiriman ulang.',entry.outcome);
+  else ack('unknown',false,entry.commitState==='intent'||entry.commitState==='uncertain'?'Status commit belum dapat dipastikan setelah pemuatan ulang. Request dikunci agar tidak menambah produk dua kali; periksa keranjang sebelum memindai ulang.':entry.message||'Pemrosesan terputus ketika halaman Menu Kasir dimuat ulang. Periksa keranjang dan riwayat transaksi; jangan kirim ulang otomatis.',{status:'RECOVERY_REQUIRED',success:false,commitState:entry.commitState||'unknown',productId:entry.productId||''});
   return;
  }
  if(data.type==='APOTEK_SCANNER_RESULT'){
@@ -7495,19 +7501,19 @@ window.addEventListener('message',function(event){
    const ack=(stage,success,message,outcome)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message,outcome:outcome||null},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim konfirmasi barcode Kasir:',e)}};
    const existing=BARCODE_KASIR_REQUESTS.get(requestId);
    if(existing){
-    if(existing.status==='completed')ack('completed',existing.success,existing.message||'Hasil request sebelumnya dipulihkan.');
+    if(existing.status==='completed')ack('completed',existing.success,existing.message||'Hasil request sebelumnya dipulihkan.',existing.outcome||null);
     else if(existing.status==='processing')ack('processing',true,existing.message||'Barcode sudah diterima; proses sebelumnya sedang berjalan.');
     else ack('unknown',false,existing.message||'Request sebelumnya terputus. Periksa keranjang dan riwayat transaksi; tidak dilakukan pengiriman ulang.');
     return;
    }
-   const entry={status:'processing',success:false,message:'Barcode diterima aplikasi Kasir. Memeriksa produk…',outcome:{status:'BARCODE_DECODED',success:false,message:'Barcode terbaca; lookup dan validasi sedang berjalan.'},updatedAt:Date.now(),nonce:String(BARCODE_SCANNER_NONCE||'')};
+   const entry={status:'processing',success:false,message:'Barcode diterima aplikasi Kasir. Memeriksa produk…',outcome:{status:'BARCODE_DECODED',success:false,message:'Barcode terbaca; lookup dan validasi sedang berjalan.'},commitState:'none',commitAt:0,productId:'',updatedAt:Date.now(),nonce:String(BARCODE_SCANNER_NONCE||'')};
    barcodeLedgerPut_(requestId,entry);
    ack('received',true,entry.message);
    let task;
    try{task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{requestId,cameraToDecodeMs:data.cameraToDecodeMs,cameraSessionElapsedMs:data.cameraSessionElapsedMs,decodeProcessingMs:data.decodeProcessingMs,detectedAt:data.detectedAt,scannerSessionId:BARCODE_SCANNER_SESSION_ID}));}
    catch(error){task=Promise.reject(error)}
    task.then(result=>{entry.status='completed';entry.outcome=BARCODE_SCANNER_OUTCOMES.get(requestId)||{status:result?'PRODUCT_ADDED':'PROCESSING_FAILED',success:!!result,message:result?'Produk berhasil ditambahkan ke keranjang.':'Barcode belum berhasil ditambahkan ke keranjang.'};entry.success=!!entry.outcome.success;entry.message=String(entry.outcome.message||'');entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',entry.success,entry.message,entry.outcome)})
-    .catch(error=>{entry.status='completed';entry.success=false;entry.outcome={status:'PROCESSING_ERROR',success:false,message:String(error?.message||error||'Gagal memproses barcode.')};entry.message=entry.outcome.message;entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',false,entry.message,entry.outcome)});
+    .catch(error=>{entry.status='completed';entry.success=false;if(entry.commitState==='intent')entry.commitState='uncertain';entry.outcome={status:'PROCESSING_ERROR',success:false,message:String(error?.message||error||'Gagal memproses barcode.')};entry.message=entry.outcome.message;entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',false,entry.message,entry.outcome)});
   }else submitUnifiedBarcode(code,'camera-popup',BARCODE_SCAN_MODE);
   return;
  }
@@ -7715,6 +7721,8 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
  if(source==='camera-direct'&&!isBarcodeScannerSessionCurrent_(scannerSessionId))return null;
  const started=barcodePerfNow_(),perf={requestId:String(perfMeta&&perfMeta.requestId||''),mode,source,cameraToDecodeMs:perfMeta&&perfMeta.cameraToDecodeMs,cameraSessionElapsedMs:perfMeta&&perfMeta.cameraSessionElapsedMs,decodeProcessingMs:perfMeta&&perfMeta.decodeProcessingMs,scannerHandoffMs:perfMeta&&perfMeta.detectedAt?Math.max(0,Date.now()-Number(perfMeta.detectedAt)):null,localLookupMs:0,serverLookupMs:0,serverReportedMs:0,serverTiming:null,gatewayTrace:null,bridgeTrace:null,validationMs:0,cartRenderMs:0,totalClientMs:0,lookupPath:'none',result:'started',failureCode:''};
  const code=unifiedBarcodeAccept_(raw,source);if(!code)return null;
+ const requestId=String(perf.requestId||'');
+ if(source==='camera-popup'&&requestId){const claim=barcodeCommitClaim_(requestId);if(!claim.ok){const outcome=barcodeCommitDuplicateOutcome_(requestId);BARCODE_SCANNER_OUTCOMES.set(requestId,outcome);console.warn('[D3] Duplicate/recovered request suppressed.',{requestId,reason:claim.reason,commitState:claim.entry&&claim.entry.commitState});return null;}}
  if(mode==='kasir')setKasirBarcodeWarning_('Barcode '+code+' diterima. Mencari produk pada database aplikasi…','warning');
  if(source==='usb-bluetooth-hid')markUsbBtScannerActivity_('ready','Input HID berhasil diterima');
  mode=resolveBarcodeMode_(mode);perf.mode=mode;
@@ -7802,9 +7810,11 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
   BARCODE_CART_COMMIT_GUARD.set(commitKey,{source,at:commitNow});
   if(BARCODE_CART_COMMIT_GUARD.size>80){const oldest=BARCODE_CART_COMMIT_GUARD.keys().next().value;BARCODE_CART_COMMIT_GUARD.delete(oldest);}
   const existing=CART.find(x=>String(x.ProdukID)===String(p.ID));
-  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);const stockMessage='Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.';if(mode==='kasir')setKasirBarcodeWarning_(stockMessage,'error');barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert(stockMessage);return null}
+  if(source==='camera-popup'&&requestId&&!barcodeCommitIntent_(requestId,p.ID)){perf.result='duplicate_suppressed';perf.failureCode='REQUEST_COMMIT_ALREADY_CLAIMED';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);return null;}
+  const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){if(source==='camera-popup'&&requestId)barcodeCommitFinalize_(requestId,'uncertain');perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);const stockMessage='Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.';if(mode==='kasir')setKasirBarcodeWarning_(stockMessage,'error');barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert(stockMessage);return null}
   perf.validationMs=barcodePerfNow_()-validationStart;
   if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
+  if(source==='camera-popup'&&requestId)barcodeCommitFinalize_(requestId,'committed');
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
   if($('kResults'))$('kResults').innerHTML=`<span class="badge green">✓ ${esc(p.NamaProduk)} | Qty ${existing?existing.Qty:1} | Stok ${p.Stok} | ${money(p.HargaJual)}</span>`;
   const cacheCaution=resolved&&(resolved.source==='local_cache_stale_fallback'||resolved.source==='local_cache_offline');
@@ -7812,7 +7822,7 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
   const cartStart=barcodePerfNow_();renderCart();scheduleKasirDraftSave();perf.cartRenderMs=barcodePerfNow_()-cartStart;barcodeBeep(true);barcodePill(p.NamaProduk+' ditambahkan · Qty '+(existing?existing.Qty:1));
   perf.result='added_to_cart';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
   return p;
- }catch(e){perf.result='processing_error';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if(scannerSessionId&&!isBarcodeScannerSessionCurrent_(scannerSessionId))return null;setKasirBarcodeWarning_('Gagal memeriksa barcode: '+(e.message||e),'error');barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
+ }catch(e){if(source==='camera-popup'&&requestId){const journal=barcodeCommitJournal_(requestId);if(journal&&journal.commitState==='intent')barcodeCommitFinalize_(requestId,'uncertain');}perf.result='processing_error';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);if(scannerSessionId&&!isBarcodeScannerSessionCurrent_(scannerSessionId))return null;setKasirBarcodeWarning_('Gagal memeriksa barcode: '+(e.message||e),'error');barcodeBeep(false);customAlert('Gagal memeriksa barcode: '+(e.message||e));return null}
 }
 // Unified Barcode Input Engine: kamera popup, input manual, USB HID, dan Bluetooth HID memakai satu jalur.
 document.addEventListener('keydown',function(e){
