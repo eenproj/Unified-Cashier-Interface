@@ -1,4 +1,4 @@
-/* APOTEK PWA API Bridge Client v1.9.3 — Gateway Iframe Lifecycle Integrity & Busy-State Recovery C3.3.2.
+/* APOTEK PWA API Bridge Client v1.9.4 — Response Acceptance, ACK Delivery & Lifecycle Finalization Assurance C3.3.3.
  * Based on C3.3 Gateway Iframe Lifecycle Optimization.
  * Adds fail-safe initialization status and deterministic runtime diagnostics.
  * Fast barcode lookup remains read-only and is never automatically retried.
@@ -7,7 +7,7 @@
   "use strict";
   const initStartedAt = Date.now();
   window.ApotekApiBridgeStatus = {
-    state: "INITIALIZING", version: "1.9.3-gateway-lifecycle-recovery-c3.3.2",
+    state: "INITIALIZING", version: "1.9.4-response-ack-finalization-c3.3.3",
     startedAt: new Date(initStartedAt).toISOString(), completedAt: null, error: null
   };
   try {
@@ -317,12 +317,24 @@
       const ackAt=Date.now();
       const delivery=deliveryTrace&&typeof deliveryTrace==="object"?deliveryTrace:{};
       event.source.postMessage({ channel:"APOTEK_PWA_GATEWAY_ACK_V1", requestId:id, ackVersion:"1.1", clientAckAt:ackAt, deliveryAttempt:Number(delivery.attempt)||null, deliveryElapsedMs:Number(delivery.elapsedMs)||null }, event.origin);
-      record(duplicate ? "MESSAGE_DUPLICATE_ACKED" : "MESSAGE_ACK_SENT", { requestIdPrefix:id.slice(0,12), origin:event.origin, deliveryAttempt:Number(delivery.attempt)||null, deliveryElapsedMs:Number(delivery.elapsedMs)||null, clientAckAt:ackAt });
+      // postMessage is fire-and-forget: this records local posting, not remote receipt.
+      record(duplicate ? "MESSAGE_DUPLICATE_ACK_POSTED" : "MESSAGE_ACK_POSTED", { requestIdPrefix:id.slice(0,12), origin:event.origin, deliveryAttempt:Number(delivery.attempt)||null, deliveryElapsedMs:Number(delivery.elapsedMs)||null, clientAckAt:ackAt, remoteReceiptConfirmed:false });
       return true;
     } catch (ackError) {
-      record("MESSAGE_ACK_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160) });
+      record("MESSAGE_ACK_POST_FAILED", { requestIdPrefix:id.slice(0,12), origin:event.origin, error:String(ackError && ackError.message || ackError).slice(0,160), remoteReceiptConfirmed:false });
       return false;
     }
+  }
+  function finalizeRequestLifecycle(id, p, state, detail) {
+    if (p.lifecycleFinalized) {
+      record("LIFECYCLE_FINALIZATION_DUPLICATE_BLOCKED", {requestIdPrefix:id.slice(0,12), method:p.method, attemptedState:state});
+      return false;
+    }
+    p.lifecycleFinalized = true;
+    p.lifecycleFinalizedAt = Date.now();
+    const transitioned = lifecycleTransition(id, state, Object.assign({method:p.method, ackPosted:!!p.responseAcked, responseAccepted:!!p.responseAccepted}, detail||{}));
+    record("LIFECYCLE_FINALIZATION_ASSURANCE", {requestIdPrefix:id.slice(0,12),method:p.method,terminalState:state,transitioned,ackPosted:!!p.responseAcked,responseAccepted:!!p.responseAccepted,finalizedAt:p.lifecycleFinalizedAt});
+    return transitioned;
   }
   function settleMessage(event, data) {
     const id = String(data.requestId || "");
@@ -379,10 +391,21 @@
       return;
     }
     const deliveryTrace=data.deliveryTrace&&typeof data.deliveryTrace==="object"?data.deliveryTrace:null;
+    if (p.responseAccepted || p.finalizing) {
+      record("MESSAGE_DUPLICATE_IN_FLIGHT_BLOCKED", {requestIdPrefix:id.slice(0,12),method:p.method,phase:p.finalizing?"FINALIZING":"ACCEPTED"});
+      acknowledgeResponse(event,id,true,deliveryTrace);
+      return;
+    }
+    p.finalizing = true;
+    p.responseAccepted = true;
+    p.responseAcceptedAt = Date.now();
+    record("MESSAGE_RESPONSE_ACCEPTED", {requestIdPrefix:id.slice(0,12),method:p.method,origin:event.origin,nestedFrame:!sourceMatchesFrame,acceptedAt:p.responseAcceptedAt});
     record("MESSAGE_DELIVERY_OBSERVED", { requestIdPrefix:id.slice(0,12), method:p.method, deliveryAttempt:deliveryTrace&&Number(deliveryTrace.attempt)||null, deliveryElapsedMs:deliveryTrace&&Number(deliveryTrace.elapsedMs)||null, responseOrigin:event.origin, nestedFrame:!sourceMatchesFrame });
     const responseAcked = acknowledgeResponse(event, id, false, deliveryTrace);
     p.responseObservedAt = Date.now();
     p.responseAcked = !!responseAcked;
+    p.ackPostedAt = responseAcked ? Date.now() : null;
+    record("MESSAGE_ACK_ASSURANCE", {requestIdPrefix:id.slice(0,12),method:p.method,ackPosted:!!responseAcked,remoteReceiptConfirmed:false,ackLatencyMs:p.ackPostedAt?p.ackPostedAt-p.responseAcceptedAt:null});
     clearTimeout(p.timer);
     if (p.softTimer) clearTimeout(p.softTimer);
     if (p.retryTimer) clearTimeout(p.retryTimer);
@@ -405,12 +428,12 @@
       const apiCode=String(data.result && data.result.code || "BACKEND_ERROR").slice(0,80);
       record("MESSAGE_API_ERROR", { requestIdPrefix:id.slice(0,12), method:p.method, code:apiCode, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, origin:event.origin });
       const apiError=new Error(String(data.result && data.result.message || "Permintaan API gagal."));apiError.code=apiCode;apiError.bridgeTrace=bridgeTrace;apiError.gatewayTrace=data.result&&data.result.gatewayTrace||null;
-      lifecycleTransition(id, "FAILED", {method:p.method,code:apiCode});
+      finalizeRequestLifecycle(id,p,"FAILED",{code:apiCode});
       p.reject(apiError);
       return;
     }
     record("MESSAGE_ACCEPTED", { requestIdPrefix:id.slice(0,12), method:p.method, elapsedMs:bridgeTrace.elapsedMs, attempts:bridgeTrace.attempts, nestedFrameAccepted:bridgeTrace.nestedFrameAccepted, origin:event.origin });
-    lifecycleTransition(id, "COMPLETED", {method:p.method,elapsedMs:bridgeTrace.elapsedMs,acknowledged:!!responseAcked});
+    finalizeRequestLifecycle(id,p,"COMPLETED",{elapsedMs:bridgeTrace.elapsedMs});
     const payload=data.result.data;
     if(payload&&typeof payload==="object"&&!Array.isArray(payload))p.resolve(Object.assign({},payload,{__bridgeTrace:bridgeTrace}));
     else p.resolve(payload);
@@ -489,7 +512,7 @@
       const softTimer = isFastBarcodeLookup ? setTimeout(() => {
         if (pending.has(id)) record("REQUEST_SLOW_WARNING", {requestIdPrefix:id.slice(0,12),method:String(method),elapsedMs:Date.now()-startedAt,softTimeoutMs:LOOKUP_SOFT_WARNING_MS,finalTimeoutMs:timeoutMs});
       }, LOOKUP_SOFT_WARNING_MS) : null;
-      const p = { resolve, reject, timer, softTimer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null };
+      const p = { resolve, reject, timer, softTimer, startedAt, method:String(method), frame, lastMessageStage:null, retryTimer:null, attempts:0, submitAttempt:null, firstSubmitAt:null, lastSubmitAt:null, responseAccepted:false, responseAcked:false, finalizing:false, lifecycleFinalized:false };
       pending.set(id, p);
       function submitAttempt(isRetry) {
         if (!navigator.onLine) return;
@@ -631,7 +654,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.9.3-gateway-lifecycle-recovery-c3.3.2",
+    version:"1.9.4-response-ack-finalization-c3.3.3",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -640,7 +663,13 @@
     getDiagnostics() { return diagnostics.slice(); },
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
-    getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_ACK|MESSAGE_DUPLICATE|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-100); },
+    getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_RESPONSE_ACCEPTED|MESSAGE_ACK|MESSAGE_DUPLICATE|LIFECYCLE_FINALIZATION|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-140); },
+    getAcceptanceSummary() {
+      const rows=diagnostics.filter(x=>/^MESSAGE_(RESPONSE_ACCEPTED|ACK_ASSURANCE|ACK_POSTED|ACK_POST_FAILED)$/.test(String(x.stage||"")));
+      const byId={}; rows.forEach(x=>{const id=x.requestIdPrefix||"unknown";(byId[id]||(byId[id]={requestIdPrefix:id}))[x.stage]=x;});
+      const recent=Object.values(byId).slice(-30).map(x=>({requestIdPrefix:x.requestIdPrefix,responseAccepted:!!x.MESSAGE_RESPONSE_ACCEPTED,ackPosted:!!(x.MESSAGE_ACK_POSTED||x.MESSAGE_ACK_ASSURANCE&&x.MESSAGE_ACK_ASSURANCE.ackPosted),ackPostFailed:!!x.MESSAGE_ACK_POST_FAILED,remoteReceiptConfirmed:false}));
+      return {trackedResponses:recent.length,ackPostedCount:recent.filter(x=>x.ackPosted).length,ackPostFailedCount:recent.filter(x=>x.ackPostFailed).length,remoteReceiptConfirmationSupported:false,recent};
+    },
     reconcileFrames() { reconcileGatewayFrames("manual"); return this.getFramePoolSummary(); },
     getFramePoolSummary() { return {poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX,warmTarget:GATEWAY_FRAME_POOL_WARM,frames:gatewayFramePool.map(f=>({name:f.name,connected:!!f.isConnected,busy:!!(f._apotekTransport&&f._apotekTransport.busy),ready:!!(f._apotekTransport&&f._apotekTransport.ready),phase:f._apotekTransport&&f._apotekTransport.phase,ownerRequestIdPrefix:String(f._apotekTransport&&(f._apotekTransport.ownerRequestId||f._apotekTransport.requestId)||"").slice(0,12),stateAgeMs:f._apotekTransport?Date.now()-Number(f._apotekTransport.stateChangedAt||Date.now()):null,loadCount:f._apotekTransport&&f._apotekTransport.loadCount}))}; },
     getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12)),lifecycleCount:lifecycle.size,lifecycleStates:this.getLifecycleSummary().stateCounts}; },
@@ -669,14 +698,14 @@
     }
   };
   window.ApotekApiBridge = Object.freeze(bridge);
-  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), frames:() => bridge.getFramePoolSummary(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
+  window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), acceptance:() => bridge.getAcceptanceSummary(), frames:() => bridge.getFramePoolSummary(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
   window.ApotekApiBridgeStatus = { state:"READY", version:bridge.version, startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:null };
   try { record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin, initDurationMs:Date.now()-initStartedAt }); } catch (diagnosticError) {
     try { console.warn("[APOTEK_PWA_BRIDGE] Initialization succeeded; diagnostic persistence failed.", diagnosticError); } catch (_) {}
   }
   } catch (error) {
     const detail = { name:String(error && error.name || "Error"), message:String(error && error.message || error).slice(0,500), stack:String(error && error.stack || "").slice(0,1800), at:new Date().toISOString() };
-    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.3-gateway-lifecycle-recovery-c3.3.2", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
+    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.4-response-ack-finalization-c3.3.3", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
     try { console.error("[APOTEK_PWA_BRIDGE] BRIDGE_INITIALIZATION_FAILED", detail); } catch (_) {}
   }
 })();
