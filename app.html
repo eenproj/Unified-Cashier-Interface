@@ -4497,20 +4497,52 @@ function debounceTask(key,fn,delay=300){
  DEBOUNCE_TASKS.set(key,timer);
 }
 let _dialogResolve=null,_dialogPrevFocus=null;
+let _activeCashierDialogBridge_=null;
+function cashierDialogId_(){return 'dlg_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10)}
+function syncCashierDialogToScanner_(){
+ const d=_activeCashierDialogBridge_;
+ if(!d||!BARCODE_SCANNER_WINDOW||!BARCODE_SCANNER_ORIGIN||BARCODE_SCAN_MODE!=='kasir')return false;
+ try{BARCODE_SCANNER_WINDOW.postMessage({type:'APOTEK_CASHIER_DIALOG_SYNC',nonce:BARCODE_SCANNER_NONCE,dialog:{id:d.id,title:d.title,message:d.message,kind:d.kind,mode:d.mode,confirmText:d.confirmText,cancelText:d.cancelText,confirmClass:d.confirmClass}},BARCODE_SCANNER_ORIGIN);return true}catch(e){console.warn('[Scanner Dialog Bridge] Gagal menyinkronkan dialog:',e);return false}
+}
+function closeCashierDialogBridge_(id){
+ const active=_activeCashierDialogBridge_;
+ if(!active||active.id!==id)return;
+ _activeCashierDialogBridge_=null;
+ try{if(BARCODE_SCANNER_WINDOW&&BARCODE_SCANNER_ORIGIN)BARCODE_SCANNER_WINDOW.postMessage({type:'APOTEK_CASHIER_DIALOG_CLOSED',nonce:BARCODE_SCANNER_NONCE,dialogId:id},BARCODE_SCANNER_ORIGIN)}catch(e){}
+}
+function handleScannerDialogAction_(event,data){
+ const active=_activeCashierDialogBridge_;
+ if(!active||!data||String(data.dialogId||'')!==active.id)return;
+ const action=data.action==='cancel'?'cancel':data.action==='confirm'?'confirm':'';
+ if(!action)return;
+ const target=action==='cancel'?active.cancelButton:active.confirmButton;
+ if(!target||!target.isConnected)return;
+ // The scanner never executes dialog business logic itself. It asks the cashier
+ // page to click the real action button, preserving the original Promise result.
+ try{target.click();event.source?.postMessage({type:'APOTEK_CASHIER_DIALOG_ACTION_ACK',nonce:BARCODE_SCANNER_NONCE,dialogId:active.id,action,ok:true},BARCODE_SCANNER_ORIGIN)}catch(error){console.warn('[Scanner Dialog Bridge] Action gagal:',error);try{event.source?.postMessage({type:'APOTEK_CASHIER_DIALOG_ACTION_ACK',nonce:BARCODE_SCANNER_NONCE,dialogId:active.id,action,ok:false,message:'Tindakan dialog tidak dapat diteruskan ke Menu Kasir.'},BARCODE_SCANNER_ORIGIN)}catch(_){}}
+}
 function openCustomDialog({title='Pemberitahuan',message='',kind='info',mode='alert',placeholder='',defaultValue='',confirmText='Mengerti',cancelText='Batal',inputType='text'}={}){
  const root=$('customDialog'),icon=$('customDialogIcon'),input=$('customDialogInput'),actions=$('customDialogActions');
  if(_dialogResolve){_dialogResolve(mode==='confirm'?false:null);_dialogResolve=null;}
+ if(_activeCashierDialogBridge_)closeCashierDialogBridge_(_activeCashierDialogBridge_.id);
+ const dialogId=cashierDialogId_();
  _dialogPrevFocus=document.activeElement;$('customDialogTitle').textContent=title;$('customDialogMessage').textContent=String(message??'');
  icon.className='dialog-icon '+kind;icon.textContent=kind==='success'?'✓':kind==='warning'?'!':kind==='error'?'×':'i';
  input.classList.toggle('hidden',mode!=='prompt');input.type=inputType;input.placeholder=placeholder;input.value=defaultValue;
  actions.innerHTML='';
- const finish=value=>{root.classList.add('hidden');document.removeEventListener('keydown',_dialogKeyHandler);const resolve=_dialogResolve;_dialogResolve=null;if(resolve)resolve(value);if(_dialogPrevFocus&&typeof _dialogPrevFocus.focus==='function')_dialogPrevFocus.focus();};
+ const finish=value=>{root.classList.add('hidden');document.removeEventListener('keydown',_dialogKeyHandler);closeCashierDialogBridge_(dialogId);const resolve=_dialogResolve;_dialogResolve=null;if(resolve)resolve(value);if(_dialogPrevFocus&&typeof _dialogPrevFocus.focus==='function')_dialogPrevFocus.focus();};
  const cancel=()=>finish(mode==='confirm'?false:null);
  const btn=(label,cls,fn)=>{const b=document.createElement('button');b.type='button';b.className='dialog-btn '+cls;b.textContent=label;b.onclick=fn;actions.appendChild(b);return b};
- if(mode!=='alert')btn(cancelText,'secondary',cancel);
- const ok=btn(confirmText,kind==='error'?'danger':kind==='success'?'success':'primary',()=>finish(mode==='prompt'?input.value:true));
+ let cancelButton=null;
+ if(mode!=='alert')cancelButton=btn(cancelText,'secondary',cancel);
+ const confirmClass=kind==='error'?'danger':kind==='success'?'success':'primary';
+ const ok=btn(confirmText,confirmClass,()=>finish(mode==='prompt'?input.value:true));
  root.onclick=e=>{if(e.target===root&&mode==='alert')finish(true)};
  document.addEventListener('keydown',_dialogKeyHandler);root.classList.remove('hidden');requestAnimationFrame(()=>{if(mode==='prompt')input.focus();else ok.focus()});
+ if(mode==='alert'||mode==='confirm'){
+  _activeCashierDialogBridge_={id:dialogId,title:String(title||'Pemberitahuan'),message:String(message??''),kind,mode,confirmText,cancelText,confirmClass,confirmButton:ok,cancelButton};
+  syncCashierDialogToScanner_();
+ }
  return new Promise(resolve=>{_dialogResolve=resolve});
 }
 function _dialogKeyHandler(e){if($('customDialog').classList.contains('hidden'))return;if(e.key==='Escape'){e.preventDefault();if(_dialogResolve){const r=_dialogResolve;_dialogResolve=null;$('customDialog').classList.add('hidden');document.removeEventListener('keydown',_dialogKeyHandler);r(false);if(_dialogPrevFocus&&_dialogPrevFocus.focus)_dialogPrevFocus.focus();}}else if(e.key==='Enter'&&e.target===$('customDialogInput')){e.preventDefault();const b=$('customDialogActions').lastElementChild;if(b)b.click()}}
@@ -7504,6 +7536,7 @@ window.addEventListener('message',function(event){
  }
  if(!expectedSource||event.source!==expectedSource||event.origin!==BARCODE_SCANNER_ORIGIN)return;
  if(!data||typeof data!=='object'||data.nonce!==BARCODE_SCANNER_NONCE)return;
+ if(data.type==='APOTEK_CASHIER_DIALOG_ACTION'&&BARCODE_SCAN_MODE==='kasir'){handleScannerDialogAction_(event,data);return;}
  if(data.type==='APOTEK_UNIFIED_CASHIER_SALE_POSTED'&&BARCODE_SCAN_MODE==='kasir'){
   // Popup melakukan posting melalui saveSale() backend yang sama. Invalidasi cache
   // agar Menu Kasir dan Daftar Penjualan mengambil transaksi terbaru dari server.
@@ -7522,6 +7555,7 @@ window.addEventListener('message',function(event){
    const bridgeUrl=String(APOTEK_BARCODE_BRIDGE_URL||'').trim();
    console.info('[Barcode Bridge] Mengirim konfigurasi scanner:',{bridgeUrlConfigured:!!bridgeUrl,sessionTokenAvailable:!!bridgeToken,mode:BARCODE_SCAN_MODE});
    expectedSource.postMessage({type:'APOTEK_SCANNER_INIT',nonce:BARCODE_SCANNER_NONCE,mode:BARCODE_SCAN_MODE,multiScan:BARCODE_SCAN_MODE==='kasir',continuous:BARCODE_SCAN_MODE==='kasir',productOptions,bridgeUrl,sessionToken:bridgeToken,clientId:APOTEK_BARCODE_CLIENT_ID,receiptPrefs:getReceiptPrefs(),pharmacyProfile:APOTEK_PROFILE||{}},BARCODE_SCANNER_ORIGIN);
+   if(BARCODE_SCAN_MODE==='kasir')setTimeout(syncCashierDialogToScanner_,0);
   }catch(e){console.warn('[Barcode Bridge] Gagal mengirim konfigurasi scanner:',e);showToast('Sesi scanner tidak dapat diperbarui. Silakan buka ulang scanner.','error')}})();
   return;
  }
