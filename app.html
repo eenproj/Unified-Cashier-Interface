@@ -1571,13 +1571,13 @@ table td:has(> .btn) { white-space: nowrap !important; }
     padding-bottom:max(6px,var(--modal-safe-bottom))!important;
   }
 }
-/* Hybrid Camera Architecture: mobile camera is captured by the Apps Script parent document. */
-#apotekEmbeddedScannerShell{display:none;position:fixed;inset:0;z-index:100030;background:#07111f;color:#f8fafc;grid-template-rows:auto minmax(0,1fr);padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
-#apotekEmbeddedScannerShell.is-open{display:grid}
-.apotek-embedded-scanner-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:#0f1d30;border-bottom:1px solid rgba(148,163,184,.22)}
+/* V2 Mobile Rendering Assurance: keep scanner outside transformed app containers. */
+#apotekEmbeddedScannerShell{display:none!important;position:fixed!important;top:0!important;left:0!important;right:0!important;bottom:0!important;width:100vw!important;height:100vh!important;height:100dvh!important;min-width:0!important;max-width:none!important;max-height:none!important;z-index:2147483000!important;box-sizing:border-box!important;overflow:hidden!important;isolation:isolate!important;contain:none!important;transform:none!important;margin:0!important;background:#07111f!important;color:#f8fafc!important;grid-template-rows:auto minmax(0,1fr)!important;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)!important}
+#apotekEmbeddedScannerShell.is-open{display:grid!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important}
+.apotek-embedded-scanner-head{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:#0f1d30;border-bottom:1px solid rgba(148,163,184,.22);min-height:58px}
 .apotek-embedded-scanner-head strong{display:block;font-size:15px}.apotek-embedded-scanner-head small{display:block;color:#a8b8cc;font-size:11px;margin-top:2px}
 .apotek-embedded-scanner-head button{width:42px;height:42px;border:1px solid rgba(203,213,225,.25);border-radius:12px;background:#1e293b;color:#fff;font-size:27px;line-height:1;cursor:pointer}
-#apotekEmbeddedScannerFrame{display:block;width:100%;height:100%;min-height:0;border:0;background:#07111f} #apotekEmbeddedScannerShell{grid-template-rows:auto minmax(0,1fr)}
+#apotekEmbeddedScannerFrame{display:block!important;position:relative!important;width:100%!important;height:100%!important;min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;flex:none!important;border:0!important;background:#07111f!important;visibility:visible!important;opacity:1!important}
 #apotekDirectCameraStage{position:relative;min-height:240px;overflow:hidden;border-radius:16px;background:#020617;border:1px solid rgba(148,163,184,.22)}
 #apotekDirectCameraReader,#apotekDirectCameraReader video{width:100%;height:100%;min-height:240px}#apotekDirectCameraReader video{object-fit:cover!important}
 #apotekDirectCameraReader__scan_region{background:transparent!important}#apotekDirectCameraReader__dashboard{display:none!important}
@@ -1588,8 +1588,8 @@ table td:has(> .btn) { white-space: nowrap !important; }
 .apotek-direct-camera-controls select{min-width:130px;flex:1}
 body.apotek-embedded-scanner-open{overflow:hidden!important;overscroll-behavior:none}
 #apotekEmbeddedScannerFrame{min-height:260px}
-@media(max-width:600px){#apotekEmbeddedScannerShell{inset:0!important;border-radius:0!important;width:100%!important;transform:none!important}#apotekEmbeddedScannerFrame{min-height:0}}
-@media(min-width:901px){#apotekEmbeddedScannerShell{inset:3vh 50%;width:min(620px,94vw);transform:translateX(-50%);border:1px solid rgba(148,163,184,.35);border-radius:18px;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,.5)}}
+@media(max-width:900px){#apotekEmbeddedScannerShell{inset:0!important;width:100vw!important;height:100vh!important;height:100dvh!important;border:0!important;border-radius:0!important;transform:none!important}}
+@media(min-width:901px){#apotekEmbeddedScannerShell{top:3vh!important;left:50%!important;right:auto!important;bottom:auto!important;width:min(620px,94vw)!important;height:min(900px,94vh)!important;height:min(900px,94dvh)!important;transform:translateX(-50%)!important;border:1px solid rgba(148,163,184,.35)!important;border-radius:18px!important;box-shadow:0 24px 80px rgba(0,0,0,.5)!important}}
 </style>
 
 
@@ -7155,6 +7155,13 @@ function isBarcodeScannerSessionCurrent_(id){return !!id&&BARCODE_SCANNER_SESSIO
 function barcodeScannerModalOpen_(){return !!document.getElementById('apotekEmbeddedScannerShell')?.classList.contains('is-open');}
 let BARCODE_SCANNER_WINDOW=null, BARCODE_SCANNER_FRAME=null, BARCODE_SCANNER_NONCE='', BARCODE_SCANNER_ORIGIN='', BARCODE_SCANNER_WATCHDOG=null, BARCODE_PRODUCT_MODAL_RESTORE=false, BARCODE_PRODUCT_MODAL_DATA=null;
 const BARCODE_PRODUCT_REQUESTS_SEEN=new Set(), BARCODE_KASIR_REQUESTS=new Map();
+const BARCODE_REQUEST_LEDGER_KEY='apotek_barcode_request_ledger_v2';
+const BARCODE_REQUEST_LEDGER_TTL=24*60*60*1000, BARCODE_REQUEST_LEDGER_LIMIT=200;
+function barcodeLedgerRead_(){try{const v=JSON.parse(sessionStorage.getItem(BARCODE_REQUEST_LEDGER_KEY)||'[]');return Array.isArray(v)?v:[]}catch(e){return []}}
+function barcodeLedgerWrite_(){try{const now=Date.now();const rows=Array.from(BARCODE_KASIR_REQUESTS.entries()).map(([requestId,e])=>({requestId,status:e.status,success:!!e.success,message:String(e.message||'').slice(0,500),updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')})).filter(e=>e.requestId&&now-e.updatedAt<=BARCODE_REQUEST_LEDGER_TTL).sort((a,b)=>a.updatedAt-b.updatedAt).slice(-BARCODE_REQUEST_LEDGER_LIMIT);sessionStorage.setItem(BARCODE_REQUEST_LEDGER_KEY,JSON.stringify(rows))}catch(e){console.warn('[Barcode Lifecycle V2] Ledger tidak dapat disimpan di sessionStorage:',e)}}
+function barcodeLedgerRestore_(){const now=Date.now();for(const e of barcodeLedgerRead_()){if(!e||!e.requestId||now-Number(e.updatedAt||0)>BARCODE_REQUEST_LEDGER_TTL)continue;const restored={status:e.status==='processing'?'interrupted':e.status,success:!!e.success,message:e.status==='processing'?'Halaman Menu Kasir dimuat ulang saat request berlangsung. Hasil transaksi perlu diperiksa; request tidak dijalankan ulang.':String(e.message||''),updatedAt:Number(e.updatedAt)||now,nonce:String(e.nonce||'')};BARCODE_KASIR_REQUESTS.set(String(e.requestId),restored)}barcodeLedgerWrite_()}
+function barcodeLedgerPut_(requestId,entry){BARCODE_KASIR_REQUESTS.set(String(requestId),entry);barcodeLedgerWrite_();}
+barcodeLedgerRestore_();
 let APOTEK_DIRECT_CAMERA_QR=null,APOTEK_DIRECT_CAMERA_MODE='kasir',APOTEK_DIRECT_CAMERA_FACING='environment',APOTEK_DIRECT_CAMERA_ACTIVE=false,APOTEK_DIRECT_CAMERA_LOADING=null,APOTEK_DIRECT_CAMERA_LAST_CODE='',APOTEK_DIRECT_CAMERA_LAST_AT=0;
 const BARCODE_SAMPLE_CODES=['8999999000016','8999999000023','1234567890128'];
 function barcodeNorm(v){return String(v??'').trim().replace(/\s+/g,'').toUpperCase()}
@@ -7229,7 +7236,7 @@ function ensureEmbeddedScannerShell_(){
  let shell=document.getElementById('apotekEmbeddedScannerShell');if(shell)return shell;
  shell=document.createElement('section');shell.id='apotekEmbeddedScannerShell';shell.setAttribute('role','dialog');shell.setAttribute('aria-modal','true');shell.setAttribute('aria-label','Barcode Scanner');
  shell.innerHTML='<header class="apotek-embedded-scanner-head"><div><strong>Barcode Scanner</strong><small id="apotekEmbeddedScannerHint">Pemindai kamera terintegrasi dengan aplikasi</small></div><button type="button" id="apotekEmbeddedScannerClose" aria-label="Tutup scanner">×</button></header><iframe id="apotekEmbeddedScannerFrame" title="Scanner Barcode Apotek" allow="camera; microphone" allowfullscreen referrerpolicy="strict-origin-when-cross-origin"></iframe>';
- document.body.appendChild(shell);
+ (document.documentElement||document.body).appendChild(shell);
  shell.querySelector('#apotekEmbeddedScannerClose').addEventListener('click',closeBarcodeScanner);
  shell.addEventListener('click',e=>{if(e.target===shell)closeBarcodeScanner()});
  return shell;
@@ -7301,6 +7308,20 @@ async function finishBarcodeScanner_(){
  BARCODE_SCANNER_WINDOW=null;BARCODE_SCANNER_FRAME=null;BARCODE_SCANNER_NONCE='';BARCODE_SCANNER_ORIGIN='';clearBarcodeScannerSession_();restoreProductScannerLayout_();
  if(BARCODE_SCAN_MODE==='product')restoreProductScannerModal_();else if(TOKEN&&USER&&CURRENT_PAGE!=='kasir')requestAnimationFrame(()=>consumeScannerReturnPage_());
 }
+function syncBarcodeScannerViewport_(){
+ const shell=document.getElementById('apotekEmbeddedScannerShell');if(!shell||!shell.classList.contains('is-open'))return;
+ const vv=window.visualViewport;const h=vv&&Number.isFinite(vv.height)?vv.height:window.innerHeight;const top=vv&&Number.isFinite(vv.offsetTop)?vv.offsetTop:0;
+ if(h>0){shell.style.height=Math.round(h)+'px';shell.style.top=Math.round(top)+'px';}
+}
+function diagnoseBarcodeScannerViewport_(stage){
+ try{const shell=document.getElementById('apotekEmbeddedScannerShell'),frame=document.getElementById('apotekEmbeddedScannerFrame');if(!shell||!frame)return;
+ const sr=shell.getBoundingClientRect(),fr=frame.getBoundingClientRect(),cs=getComputedStyle(shell),vv=window.visualViewport;
+ const d={stage,viewport:{innerWidth:innerWidth,innerHeight:innerHeight,visualWidth:vv?.width||null,visualHeight:vv?.height||null,offsetTop:vv?.offsetTop||0},shell:{display:cs.display,visibility:cs.visibility,opacity:cs.opacity,zIndex:cs.zIndex,x:Math.round(sr.x),y:Math.round(sr.y),width:Math.round(sr.width),height:Math.round(sr.height),connected:shell.isConnected,parent:shell.parentElement?.tagName},frame:{width:Math.round(fr.width),height:Math.round(fr.height),connected:frame.isConnected}};
+ console.info('[Barcode Mobile Rendering V2]',d);
+ }catch(e){console.warn('[Barcode Mobile Rendering V2] Diagnostik gagal:',String(e&&e.message||e))}
+}
+if(window.visualViewport){window.visualViewport.addEventListener('resize',syncBarcodeScannerViewport_,{passive:true});window.visualViewport.addEventListener('scroll',syncBarcodeScannerViewport_,{passive:true});}
+window.addEventListener('resize',syncBarcodeScannerViewport_,{passive:true});
 function openBarcodeScanner(mode='kasir'){
  BARCODE_SCAN_MODE=mode==='product'?'product':'kasir';
  const cfg=barcodeScannerConfig();
@@ -7318,6 +7339,7 @@ function openBarcodeScanner(mode='kasir'){
  frame.setAttribute('allow','camera; microphone');
  frame.src=u.href;
  shell.classList.add('is-open');document.body.classList.add('apotek-embedded-scanner-open');
+ syncBarcodeScannerViewport_();requestAnimationFrame(()=>requestAnimationFrame(()=>diagnoseBarcodeScannerViewport_('opened')));
  setProductScannerSplit_(true,true);
  if(mode==='product'){BARCODE_PRODUCT_MODAL_RESTORE=false;BARCODE_PRODUCT_MODAL_DATA=null;closeModal();}
  barcodePill(mode==='product'?'Scanner Tambah Produk dibuka di dalam modal.':'Scanner Kasir dibuka di dalam modal.');
@@ -7451,9 +7473,10 @@ window.addEventListener('message',function(event){
   const requestId=String(data.requestId||'');if(!requestId)return;
   const entry=BARCODE_KASIR_REQUESTS.get(requestId);
   const ack=(stage,success,message)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message,probe:true},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim status scanner:',e)}};
-  if(!entry){ack('unknown',false,'Status proses tidak tersedia pada sesi Menu Kasir ini. Jangan kirim ulang otomatis; periksa keranjang transaksi terlebih dahulu.');return;}
+  if(!entry){ack('unknown',false,'Status request tidak ditemukan dalam riwayat sesi ini. Jangan kirim ulang otomatis; periksa keranjang dan riwayat transaksi terlebih dahulu.');return;}
   if(entry.status==='completed')ack('completed',entry.success,entry.message);
-  else ack('processing',true,'Menu Kasir masih memproses barcode.');
+  else if(entry.status==='processing')ack('processing',true,'Menu Kasir masih memproses barcode. Tidak ada pengiriman ulang.');
+  else ack('unknown',false,entry.message||'Pemrosesan terputus ketika halaman Menu Kasir dimuat ulang. Periksa keranjang dan riwayat transaksi; jangan kirim ulang otomatis.');
   return;
  }
  if(data.type==='APOTEK_SCANNER_RESULT'){
@@ -7463,16 +7486,20 @@ window.addEventListener('message',function(event){
   if(BARCODE_SCAN_MODE==='kasir'&&requestId){
    const ack=(stage,success,message)=>{try{expectedSource.postMessage({type:'APOTEK_SCANNER_RESULT_ACK',nonce:BARCODE_SCANNER_NONCE,requestId,stage,success,message},BARCODE_SCANNER_ORIGIN)}catch(e){console.warn('Gagal mengirim konfirmasi barcode Kasir:',e)}};
    const existing=BARCODE_KASIR_REQUESTS.get(requestId);
-   if(existing){ack(existing.status==='completed'?'completed':'processing',existing.success,existing.message||'Barcode sudah diterima; proses sebelumnya sedang berjalan.');return;}
-   const entry={status:'processing',success:false,message:'Barcode diterima aplikasi Kasir. Memeriksa produk…',updatedAt:Date.now()};
-   BARCODE_KASIR_REQUESTS.set(requestId,entry);
+   if(existing){
+    if(existing.status==='completed')ack('completed',existing.success,existing.message||'Hasil request sebelumnya dipulihkan.');
+    else if(existing.status==='processing')ack('processing',true,existing.message||'Barcode sudah diterima; proses sebelumnya sedang berjalan.');
+    else ack('unknown',false,existing.message||'Request sebelumnya terputus. Periksa keranjang dan riwayat transaksi; tidak dilakukan pengiriman ulang.');
+    return;
+   }
+   const entry={status:'processing',success:false,message:'Barcode diterima aplikasi Kasir. Memeriksa produk…',updatedAt:Date.now(),nonce:String(BARCODE_SCANNER_NONCE||'')};
+   barcodeLedgerPut_(requestId,entry);
    ack('received',true,entry.message);
    let task;
    try{task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,cameraSessionElapsedMs:data.cameraSessionElapsedMs,decodeProcessingMs:data.decodeProcessingMs,detectedAt:data.detectedAt,scannerSessionId:BARCODE_SCANNER_SESSION_ID}));}
    catch(error){task=Promise.reject(error)}
-   task.then(result=>{entry.status='completed';entry.success=!!result;entry.message=result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';entry.updatedAt=Date.now();ack('completed',entry.success,entry.message)})
-    .catch(error=>{entry.status='completed';entry.success=false;entry.message=String(error?.message||error||'Gagal memproses barcode.');entry.updatedAt=Date.now();ack('completed',false,entry.message)})
-    .finally(()=>{setTimeout(()=>{if(BARCODE_KASIR_REQUESTS.get(requestId)===entry)BARCODE_KASIR_REQUESTS.delete(requestId)},120000)});
+   task.then(result=>{entry.status='completed';entry.success=!!result;entry.message=result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',entry.success,entry.message)})
+    .catch(error=>{entry.status='completed';entry.success=false;entry.message=String(error?.message||error||'Gagal memproses barcode.');entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',false,entry.message)});
   }else submitUnifiedBarcode(code,'camera-popup',BARCODE_SCAN_MODE);
   return;
  }
