@@ -7282,6 +7282,27 @@ function isMobileEmbeddedScanner_(){
  const ua=navigator.userAgent||'';
  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua)||(window.matchMedia&&window.matchMedia('(pointer:coarse)').matches&&window.innerWidth<=900);
 }
+function isIOSCameraBrowser_(){const ua=navigator.userAgent||'';return /iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1)}
+function openIOSScannerStandalone_(url){
+ // Safari/iOS can restrict getUserMedia in embedded cross-origin iframes.
+ // Open the scanner from this explicit user gesture as a top-level tab so
+ // the camera permission belongs directly to the scanner origin.
+ let popup=null;try{popup=window.open(url,'_blank')}catch(e){console.warn('[Scanner iOS] Popup open failed:',e)}
+ if(!popup)return false;
+ BARCODE_SCANNER_WINDOW=popup;BARCODE_SCANNER_FRAME=null;
+ setProductScannerSplit_(false,false);
+ barcodePill('Scanner dibuka pada tab Safari tersendiri agar akses kamera iOS tidak terhalang iframe. Kembali ke tab aplikasi setelah pemindaian.');
+ if(BARCODE_SCANNER_WATCHDOG)clearInterval(BARCODE_SCANNER_WATCHDOG);
+ BARCODE_SCANNER_WATCHDOG=setInterval(()=>{
+  try{if(BARCODE_SCANNER_WINDOW&&BARCODE_SCANNER_WINDOW.closed){
+   clearInterval(BARCODE_SCANNER_WATCHDOG);BARCODE_SCANNER_WATCHDOG=null;
+   BARCODE_SCANNER_WINDOW=null;BARCODE_SCANNER_FRAME=null;BARCODE_SCANNER_NONCE='';BARCODE_SCANNER_ORIGIN='';clearBarcodeScannerSession_();restoreProductScannerLayout_();
+   if(BARCODE_SCAN_MODE==='product')restoreProductScannerModal_();
+  }}catch(e){/* Cross-origin WindowProxy.closed is intentionally treated as unknown. */}
+ },1800);
+ console.info('[Scanner iOS] Standalone camera tab opened.',{origin:location.origin,mode:BARCODE_SCAN_MODE});
+ return true;
+}
 function ensureEmbeddedScannerShell_(){
  let shell=document.getElementById('apotekEmbeddedScannerShell');if(shell)return shell;
  shell=document.createElement('section');shell.id='apotekEmbeddedScannerShell';shell.setAttribute('role','dialog');shell.setAttribute('aria-modal','true');shell.setAttribute('aria-label','Barcode Scanner');
@@ -7383,6 +7404,7 @@ function openBarcodeScanner(mode='kasir'){
  persistBarcodeScannerSession_();
  const u=new URL(cfg.url);u.searchParams.set('mode',BARCODE_SCAN_MODE);u.searchParams.set('nonce',BARCODE_SCANNER_NONCE);u.searchParams.set('parentOrigin',location.origin);
  u.searchParams.set('multiScan',BARCODE_SCAN_MODE==='kasir'?'true':'false');
+ if(isIOSCameraBrowser_()&&openIOSScannerStandalone_(u.href))return;
  const shell=ensureEmbeddedScannerShell_(),frame=shell.querySelector('#apotekEmbeddedScannerFrame');
  if(!frame){clearBarcodeScannerSession_();customAlert('Komponen modal scanner tidak dapat dibuat. Muat ulang aplikasi.');return;}
  BARCODE_SCANNER_FRAME=frame;BARCODE_SCANNER_WINDOW=frame.contentWindow;
