@@ -7,7 +7,7 @@
   "use strict";
   const initStartedAt = Date.now();
   window.ApotekApiBridgeStatus = {
-    state: "INITIALIZING", version: "1.9.1-runtime-init-c3.3.1",
+    state: "INITIALIZING", version: "1.9.2-safe-dom-mount-c3.3.1.1",
     startedAt: new Date(initStartedAt).toISOString(), completedAt: null, error: null
   };
   try {
@@ -100,6 +100,19 @@
     frame._apotekReadyPromise = new Promise(resolve => { resolveReady = resolve; });
     frame._apotekResolveReady = resolveReady;
   }
+  function getDocumentMountRoot() {
+    // api-bridge.js is loaded from the document <head>; document.body may
+    // not exist yet. documentElement is a valid temporary mount point.
+    return document.body || document.documentElement;
+  }
+  function appendToDocument(node) {
+    const root = getDocumentMountRoot();
+    if (!root || typeof root.appendChild !== "function") {
+      throw new Error("Dokumen belum memiliki mount point untuk API Bridge.");
+    }
+    root.appendChild(node);
+    return node;
+  }
   function createFrame(requestId, pooled) {
     const frame = document.createElement("iframe");
     frame.name = "apotek_pwa_gateway_frame_" + makeId().slice(0,24);
@@ -133,7 +146,7 @@
         record("FRAME_LOAD_UNEXPECTED", {frameName:frame.name,requestIdPrefix:String(t.requestId||"").slice(0,12),phase:String(t.phase||"unknown"),loadCount:t.loadCount});
       }
     });
-    document.body.appendChild(frame);
+    appendToDocument(frame);
     frame.src="about:blank";
     record("FRAME_CREATED", {frameName:frame.name,requestIdPrefix:String(requestId||"").slice(0,12),pooled:!!frame._apotekPooled,poolSize:gatewayFramePool.length,visibility:document.visibilityState});
     return frame;
@@ -433,7 +446,7 @@
           input.type = "hidden"; input.name = key; input.value = String(value);
           form.appendChild(input);
         }
-        document.body.appendChild(form);
+        appendToDocument(form);
         try {
           form.submit();
           record("REQUEST_SUBMIT_CALLED", { requestIdPrefix:id.slice(0,12), method:String(method).slice(0,60), attempt:attempts });
@@ -553,7 +566,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.9.1-runtime-init-c3.3.1",
+    version:"1.9.2-safe-dom-mount-c3.3.1.1",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -597,7 +610,7 @@
   }
   } catch (error) {
     const detail = { name:String(error && error.name || "Error"), message:String(error && error.message || error).slice(0,500), stack:String(error && error.stack || "").slice(0,1800), at:new Date().toISOString() };
-    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.1-runtime-init-c3.3.1", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
+    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.2-safe-dom-mount-c3.3.1.1", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
     try { console.error("[APOTEK_PWA_BRIDGE] BRIDGE_INITIALIZATION_FAILED", detail); } catch (_) {}
   }
 })();
