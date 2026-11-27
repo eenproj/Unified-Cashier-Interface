@@ -4162,7 +4162,7 @@ select,textarea){
 .session-recovery-actions .btn{min-width:125px}
 </style>
 
-<script>window.APOTEK_PWA_MODE=true;</script><script src="./pwa-config.js"></script><script src="./api-bridge.js"></script></head>
+<script>window.APOTEK_PWA_MODE=true;window.ApotekPwaAssetStatus={config:"PENDING",bridge:"PENDING",updatedAt:Date.now()};</script><script src="./pwa-config.js" onload="window.ApotekPwaAssetStatus.config='LOADED';window.ApotekPwaAssetStatus.updatedAt=Date.now()" onerror="window.ApotekPwaAssetStatus.config='FAILED';window.ApotekPwaAssetStatus.updatedAt=Date.now();console.error('[APOTEK_PWA] pwa-config.js failed to load')"></script><script src="./api-bridge.js" onload="window.ApotekPwaAssetStatus.bridge=(window.ApotekApiBridgeStatus&&window.ApotekApiBridgeStatus.state==='READY')?'READY':'LOADED_NOT_READY';window.ApotekPwaAssetStatus.updatedAt=Date.now();console.info('[APOTEK_PWA] Bridge asset load status',window.ApotekPwaAssetStatus,window.ApotekApiBridgeStatus||null)" onerror="window.ApotekPwaAssetStatus.bridge='FAILED_TO_LOAD';window.ApotekPwaAssetStatus.updatedAt=Date.now();console.error('[APOTEK_PWA] api-bridge.js failed to load')"></script></head>
 <body data-reset-token="">
 <div id="sessionBootstrap" class="session-bootstrap" role="status" aria-live="polite"><div class="session-bootstrap-card"><span class="session-bootstrap-spinner"></span><strong>Memeriksa sesi aplikasi...</strong><span>Mohon tunggu sebentar.</span></div></div>
 <div id="login" class="login hidden">
@@ -4624,6 +4624,13 @@ async function init(isRetry=false){
  restoreBarcodeScannerSession_();
  showSessionBootstrap(isRetry?'Menghubungkan kembali ke server...':'Memeriksa sesi aplikasi...');
  if(APOTEK_PWA_MODE){
+  const bridgeStatus=window.ApotekApiBridgeStatus||null;
+  if(!window.ApotekApiBridge||typeof window.ApotekApiBridge.restoreSession!=="function"||!bridgeStatus||bridgeStatus.state!=="READY"){
+   const detail=bridgeStatus&&bridgeStatus.error?String(bridgeStatus.error.message||"Inisialisasi gagal"):(window.ApotekPwaAssetStatus?.bridge||"Bridge tidak tersedia");
+   console.error("[PWA] API Bridge belum siap; session bootstrap dihentikan.",{bridgeStatus,assetStatus:window.ApotekPwaAssetStatus||null});
+   const el=$('sessionBootstrap');if(el){el.classList.remove('hidden');el.innerHTML=`<div class="session-bootstrap-card"><strong>Koneksi aplikasi belum siap</strong><span>${esc('API Bridge gagal diinisialisasi: '+detail)}</span><div class="session-recovery-actions"><button class="btn primary" type="button" onclick="location.reload()">Muat Ulang Aplikasi</button></div></div>`;}
+   return false;
+  }
   const rememberBox=$('loginRemember');if(rememberBox)rememberBox.checked=false;
   // Restore the persisted rotating refresh credential before deciding that the
   // user is unauthenticated. A page reload creates a new JS context, so the
