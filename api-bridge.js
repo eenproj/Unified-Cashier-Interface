@@ -1,4 +1,4 @@
-/* APOTEK PWA API Bridge Client v1.9.1 — Runtime Initialization & Deployment Consistency C3.3.1.
+/* APOTEK PWA API Bridge Client v1.9.3 — Gateway Iframe Lifecycle Integrity & Busy-State Recovery C3.3.2.
  * Based on C3.3 Gateway Iframe Lifecycle Optimization.
  * Adds fail-safe initialization status and deterministic runtime diagnostics.
  * Fast barcode lookup remains read-only and is never automatically retried.
@@ -7,7 +7,7 @@
   "use strict";
   const initStartedAt = Date.now();
   window.ApotekApiBridgeStatus = {
-    state: "INITIALIZING", version: "1.9.2-safe-dom-mount-c3.3.1.1",
+    state: "INITIALIZING", version: "1.9.3-gateway-lifecycle-recovery-c3.3.2",
     startedAt: new Date(initStartedAt).toISOString(), completedAt: null, error: null
   };
   try {
@@ -121,7 +121,7 @@
     frame.tabIndex = -1;
     frame.style.cssText = "position:absolute;width:1px;height:1px;left:-10000px;border:0";
     frame._apotekPooled = pooled !== false;
-    frame._apotekTransport = { requestId:requestId||"", createdAt:Date.now(), leaseAt:Date.now(), loadCount:0, lastLoadAt:null, phase:"WAITING_INITIAL_BLANK", busy:!!requestId, ready:false };
+    frame._apotekTransport = { requestId:requestId||"", createdAt:Date.now(), leaseAt:Date.now(), loadCount:0, lastLoadAt:null, phase:"WAITING_INITIAL_BLANK", busy:!!requestId, ready:false, ownerRequestId:requestId||"", stateChangedAt:Date.now(), resetStartedAt:null };
     makeFrameReadyPromise(frame);
     frame.addEventListener("load", () => {
       const t=frame._apotekTransport||{};
@@ -129,7 +129,7 @@
       t.lastLoadAt=Date.now();
       if (t.phase === "WAITING_INITIAL_BLANK" || t.phase === "WAITING_RESET_BLANK") {
         t.ready=true;
-        t.phase=t.busy?"RESERVED":"IDLE";
+        t.phase=t.busy?"RESERVED":"IDLE"; t.stateChangedAt=Date.now();
         record(t.phase === "IDLE" ? "FRAME_POOL_READY" : "FRAME_INITIAL_READY", {
           frameName:frame.name, requestIdPrefix:String(t.requestId||"").slice(0,12),
           loadCount:t.loadCount, sinceFrameCreatedMs:t.lastLoadAt-t.createdAt,
@@ -140,7 +140,7 @@
         return;
       }
       if (t.phase === "DISPATCHED") {
-        t.phase="RESPONSE_DOCUMENT_LOADED";
+        t.phase="RESPONSE_DOCUMENT_LOADED"; t.stateChangedAt=Date.now();
         record("FRAME_RESPONSE_LOAD", { frameName:frame.name, requestIdPrefix:String(t.requestId||"").slice(0,12), loadCount:t.loadCount, sinceDispatchMs:t.lastLoadAt-(t.dispatchAt||t.leaseAt), connected:frame.isConnected, visibility:document.visibilityState });
       } else {
         record("FRAME_LOAD_UNEXPECTED", {frameName:frame.name,requestIdPrefix:String(t.requestId||"").slice(0,12),phase:String(t.phase||"unknown"),loadCount:t.loadCount});
@@ -159,7 +159,7 @@
     let frame=gatewayFramePool.find(f => f.isConnected && !f._apotekTransport.busy && f._apotekTransport.ready && f._apotekTransport.phase === "IDLE");
     if (frame) {
       const t=frame._apotekTransport;
-      t.requestId=requestId; t.busy=true; t.ready=true; t.phase="RESERVED";
+      t.requestId=requestId; t.ownerRequestId=requestId; t.busy=true; t.ready=true; t.phase="RESERVED"; t.stateChangedAt=Date.now(); t.resetStartedAt=null;
       t.leaseAt=Date.now(); t.dispatchAt=null; t.lastLoadAt=null; t.loadCount=0;
       makeFrameReadyPromise(frame);
       // A reused blank frame is already ready; resolve without waiting for another load.
@@ -173,26 +173,87 @@
     else record("FRAME_POOL_OVERFLOW_TRANSIENT", {requestIdPrefix:requestId.slice(0,12),poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX});
     return frame;
   }
-  function resetOrRemoveFrame(frame, requestId, reason) {
-    if (!frame) return;
+  function resetOrRemoveFrame(frame, requestId, reason, options) {
+    if (!frame) return false;
     const t=frame._apotekTransport||{};
-    if (!frame.isConnected) return;
+    if (!frame.isConnected) return false;
+    const expectedId=String(requestId||"");
+    const currentOwner=String(t.ownerRequestId||t.requestId||"");
+    if (expectedId && currentOwner && expectedId!==currentOwner) {
+      record("FRAME_RELEASE_OWNERSHIP_MISMATCH", {
+        frameName:frame.name, requestedOwnerPrefix:expectedId.slice(0,12),
+        actualOwnerPrefix:currentOwner.slice(0,12), reason:String(reason||"release")
+      });
+      return false;
+    }
     if (!frame._apotekPooled) {
       frame.remove();
-      record("FRAME_TRANSIENT_REMOVED", {requestIdPrefix:String(requestId||t.requestId||"").slice(0,12),reason:String(reason||"released")});
-      return;
+      record("FRAME_TRANSIENT_REMOVED", {requestIdPrefix:String(requestId||currentOwner).slice(0,12),reason:String(reason||"released")});
+      return true;
     }
-    t.requestId=""; t.busy=false; t.ready=false; t.phase="WAITING_RESET_BLANK"; t.dispatchAt=null; t.leaseAt=Date.now();
+    t.requestId=""; t.ownerRequestId=""; t.busy=false; t.ready=false;
+    t.phase="WAITING_RESET_BLANK"; t.dispatchAt=null; t.leaseAt=Date.now();
+    t.stateChangedAt=Date.now(); t.resetStartedAt=Date.now();
     makeFrameReadyPromise(frame);
     try {
       frame.src="about:blank";
-      record("FRAME_POOL_RESET", {frameName:frame.name,requestIdPrefix:String(requestId||"").slice(0,12),reason:String(reason||"released")});
+      record("FRAME_POOL_RESET", {frameName:frame.name,requestIdPrefix:String(requestId||currentOwner).slice(0,12),reason:String(reason||"released")});
+      return true;
     } catch (error) {
       const i=gatewayFramePool.indexOf(frame); if(i>=0)gatewayFramePool.splice(i,1);
       frame.remove();
-      record("FRAME_POOL_RESET_FAILED", {requestIdPrefix:String(requestId||"").slice(0,12),error:String(error&&error.message||error).slice(0,120)});
+      record("FRAME_POOL_RESET_FAILED", {requestIdPrefix:String(requestId||currentOwner).slice(0,12),error:String(error&&error.message||error).slice(0,120)});
+      return false;
     }
   }
+  function frameHasLiveOwner(frame, now) {
+    const t=frame&&frame._apotekTransport||{};
+    const id=String(t.ownerRequestId||t.requestId||"");
+    if (!id) return false;
+    if (pending.has(id)) return true;
+    const done=completed.get(id);
+    if (done && done.expiresAt>now && done.frame===frame) return true;
+    const late=lateRequests.get(id);
+    if (late && late.expiresAt>now && late.frame===frame) return true;
+    return false;
+  }
+  function reconcileGatewayFrames(trigger) {
+    const now=Date.now();
+    for (const frame of gatewayFramePool.slice()) {
+      if (!frame || !frame.isConnected) continue;
+      const t=frame._apotekTransport||{};
+      if (t.busy && !frameHasLiveOwner(frame,now)) {
+        const age=now-Number(t.stateChangedAt||t.leaseAt||now);
+        // Recovery is deliberately limited to a response document already loaded.
+        // DISPATCHED frames are never force-released: they may still deliver a valid response.
+        if (t.phase==="RESPONSE_DOCUMENT_LOADED" && age>=COMPLETED_ACK_TTL_MS+3000) {
+          const orphanId=String(t.ownerRequestId||t.requestId||"");
+          record("FRAME_ORPHANED_BUSY_STATE_DETECTED", {
+            frameName:frame.name,requestIdPrefix:orphanId.slice(0,12),
+            phase:t.phase,ageMs:age,trigger:String(trigger||"periodic")
+          });
+          resetOrRemoveFrame(frame,orphanId,"orphaned_busy_state_recovery");
+          record("FRAME_ORPHANED_BUSY_STATE_RECOVERED", {
+            frameName:frame.name,requestIdPrefix:orphanId.slice(0,12),
+            trigger:String(trigger||"periodic")
+          });
+        }
+      } else if (!t.busy && t.phase==="WAITING_RESET_BLANK" && t.resetStartedAt &&
+                 now-Number(t.resetStartedAt)>=GATEWAY_FRAME_READY_TIMEOUT_MS) {
+        // A reset navigation that never emits load is quarantined and removed;
+        // the next request can create a clean frame instead of waiting forever.
+        const i=gatewayFramePool.indexOf(frame); if(i>=0)gatewayFramePool.splice(i,1);
+        frame.remove();
+        record("FRAME_RESET_STALLED_REMOVED", {frameName:frame.name,ageMs:now-t.resetStartedAt,trigger:String(trigger||"periodic")});
+      }
+    }
+  }
+  const FRAME_RECONCILIATION_INTERVAL_MS = 5000;
+  const frameReconciliationTimer = setInterval(() => {
+    try { reconcileGatewayFrames("periodic"); }
+    catch (error) { record("FRAME_RECONCILIATION_ERROR",{message:String(error&&error.message||error).slice(0,160)}); }
+  }, FRAME_RECONCILIATION_INTERVAL_MS);
+  if (frameReconciliationTimer && typeof frameReconciliationTimer.unref==="function") frameReconciliationTimer.unref();
   // Warm two blank frames. They are not used until the browser confirms their
   // initial about:blank load; requests can still create additional pooled frames.
   for (let i=0;i<GATEWAY_FRAME_POOL_WARM;i++) {
@@ -331,7 +392,11 @@
     const done = { origin:event.origin, source:event.source, frame:p.frame, expiresAt:Date.now()+COMPLETED_ACK_TTL_MS };
     completed.set(id, done);
     setTimeout(() => {
-      if (completed.get(id) === done) completed.delete(id);
+      if (completed.get(id) !== done) {
+        record("FRAME_COMPLETED_CLEANUP_SKIPPED", {requestIdPrefix:id.slice(0,12),reason:"completion_record_replaced"});
+        return;
+      }
+      completed.delete(id);
       resetOrRemoveFrame(p.frame, id, "completed_ack_window_expired");
     }, COMPLETED_ACK_TTL_MS);
     const responseAt=Date.now();
@@ -566,7 +631,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.9.2-safe-dom-mount-c3.3.1.1",
+    version:"1.9.3-gateway-lifecycle-recovery-c3.3.2",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -576,7 +641,8 @@
     getPersistentDiagnostics() { try { return JSON.parse(localStorage.getItem("apotek_pwa_bridge_diag_v1")||"[]"); } catch (_) { return []; } },
     getLastDiagnostic() { return lastDiagnostic; },
     getTransportDiagnostics() { return diagnostics.filter(x => /FRAME_|MESSAGE_DELIVERY|MESSAGE_ACK|MESSAGE_DUPLICATE|REQUEST_TIMEOUT_CONTEXT|LATE_RESPONSE/.test(String(x.stage||""))).slice(-100); },
-    getFramePoolSummary() { return {poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX,warmTarget:GATEWAY_FRAME_POOL_WARM,frames:gatewayFramePool.map(f=>({name:f.name,connected:!!f.isConnected,busy:!!(f._apotekTransport&&f._apotekTransport.busy),ready:!!(f._apotekTransport&&f._apotekTransport.ready),phase:f._apotekTransport&&f._apotekTransport.phase,loadCount:f._apotekTransport&&f._apotekTransport.loadCount}))}; },
+    reconcileFrames() { reconcileGatewayFrames("manual"); return this.getFramePoolSummary(); },
+    getFramePoolSummary() { return {poolSize:gatewayFramePool.length,maxPool:GATEWAY_FRAME_POOL_MAX,warmTarget:GATEWAY_FRAME_POOL_WARM,frames:gatewayFramePool.map(f=>({name:f.name,connected:!!f.isConnected,busy:!!(f._apotekTransport&&f._apotekTransport.busy),ready:!!(f._apotekTransport&&f._apotekTransport.ready),phase:f._apotekTransport&&f._apotekTransport.phase,ownerRequestIdPrefix:String(f._apotekTransport&&(f._apotekTransport.ownerRequestId||f._apotekTransport.requestId)||"").slice(0,12),stateAgeMs:f._apotekTransport?Date.now()-Number(f._apotekTransport.stateChangedAt||Date.now()):null,loadCount:f._apotekTransport&&f._apotekTransport.loadCount}))}; },
     getPendingSummary() { return {pendingCount:pending.size,maxPending:MAX_PENDING_REQUESTS,requestIds:Array.from(pending.keys()).map(x=>x.slice(0,12)),completedCount:completed.size,lateDeliveryWatchCount:lateRequests.size,maxLateResponseWatches:MAX_LATE_RESPONSE_WATCHES,lateRequestIds:Array.from(lateRequests.keys()).map(x=>x.slice(0,12)),lifecycleCount:lifecycle.size,lifecycleStates:this.getLifecycleSummary().stateCounts}; },
     clearDiagnostics() { diagnostics.length=0; lastDiagnostic=null; return true; },
     getUser() { return auth.user; },
@@ -610,7 +676,7 @@
   }
   } catch (error) {
     const detail = { name:String(error && error.name || "Error"), message:String(error && error.message || error).slice(0,500), stack:String(error && error.stack || "").slice(0,1800), at:new Date().toISOString() };
-    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.2-safe-dom-mount-c3.3.1.1", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
+    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.3-gateway-lifecycle-recovery-c3.3.2", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
     try { console.error("[APOTEK_PWA_BRIDGE] BRIDGE_INITIALIZATION_FAILED", detail); } catch (_) {}
   }
 })();
