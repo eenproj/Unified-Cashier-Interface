@@ -4856,7 +4856,6 @@ function restoreOfflineMaster(){
  try{
   const snapshot=JSON.parse(localStorage.getItem(tenantStorageKey_(OFFLINE_MASTER_KEY))||'null');
   if(!snapshot||snapshot.version!==1||!snapshot.master||!Array.isArray(snapshot.master.produk))return false;
-  if(!TOKEN)return false;
   USER=snapshot.user||USER||{nama:'Pengguna',role:'KASIR'};
   DATA={user:USER,master:{produk:snapshot.master.produk||[],kategori:snapshot.master.kategori||[],satuan:snapshot.master.satuan||[],rak:[],supplier:[]},settings:snapshot.settings||{},dashboard:{cards:{}}};
   APOTEK_PROFILE=snapshot.apotek||APOTEK_PROFILE;
@@ -5084,19 +5083,19 @@ function reconcileMutationInBackground_(domains,options={}){
  return task;
 }
 function isNetworkFailure(e){const m=String(e?.message||e||'').toLowerCase();return !navigator.onLine||/network|failed to fetch|fetch failed|connection|timed out|timeout|unavailable|server unreachable|internet/i.test(m)}
-function offlineQueueRead(){try{const q=JSON.parse(localStorage.getItem(tenantStorageKey_(OFFLINE_SALES_KEY))||'[]');if(!Array.isArray(q))return[];return q.map(x=>x&&x.status==='SYNCING'?{...x,status:'PENDING'}:x)}catch(e){return[]}}
+function offlineQueueRead(){try{const q=JSON.parse(localStorage.getItem(tenantStorageKey_(OFFLINE_SALES_KEY))||'[]');if(!Array.isArray(q))return[];return q.map(x=>x&&x.status==='SYNCING'?{...x,status:'UNKNOWN',error:'Sinkronisasi terputus ketika status server belum dikonfirmasi. Periksa riwayat server sebelum tindakan manual.'}:x)}catch(e){return[]}}
 function offlineQueueWrite(q){try{localStorage.setItem(tenantStorageKey_(OFFLINE_SALES_KEY),JSON.stringify(q));updateOfflineStatus();return true}catch(e){customAlert('Antrean offline tidak dapat disimpan. Penyimpanan browser penuh; jangan tutup halaman sebelum masalah ini diatasi.');return false}}
 function updateOfflineStatus(){
- const el=$('offlineStatus');if(!el)return;const q=offlineQueueRead(),pending=q.filter(x=>x.status!=='SYNCED').length;
+ const el=$('offlineStatus');if(!el)return;const q=offlineQueueRead(),pending=q.filter(x=>x.status!=='SYNCED').length,unknown=q.filter(x=>x.status==='UNKNOWN').length;
  el.textContent=(OFFLINE_MODE||!navigator.onLine?'● Offline — transaksi akan disimpan di perangkat':'● Online — data tersimpan di server')+(pending?' · '+pending+' transaksi menunggu sinkronisasi':'');
  el.style.color=(OFFLINE_MODE||!navigator.onLine)?'#b45309':'#15803d';
- const box=$('offlineQueueNotice');if(box){const failed=q.filter(x=>x.status==='FAILED');const errors=failed.slice(0,3).map(x=>`<div style="font-size:12px;margin-top:5px"><strong>${esc(x.id)}</strong>: ${esc(x.error||'Perlu pemeriksaan')}</div>`).join('');box.innerHTML=pending?`<div class="muted">${pending} transaksi offline belum tersinkron.</div>${errors}<button class="btn primary" style="margin-top:8px" type="button" onclick="syncOfflineSales(true)">${failed.length?'Coba Sinkronkan Ulang':'Sinkronkan Sekarang'}</button>`:'';box.classList.toggle('hidden',!pending)}
+ const box=$('offlineQueueNotice');if(box){const failed=q.filter(x=>x.status==='FAILED'||x.status==='UNKNOWN');const errors=failed.slice(0,5).map(x=>`<div style="font-size:12px;margin-top:5px"><strong>${esc(x.id)}</strong>: ${esc(x.error||'Perlu pemeriksaan')}</div>`).join('');box.innerHTML=pending?`<div class="muted">${pending} transaksi offline belum tersinkron. ${unknown?' '+unknown+' transaksi berstatus UNKNOWN dan wajib diperiksa pada riwayat server sebelum dicoba ulang.':''}</div>${errors}<button class="btn primary" style="margin-top:8px" type="button" onclick="syncOfflineSales(true)">${failed.length?'Coba Sinkronkan Ulang (hanya yang FAILED)':'Sinkronkan Sekarang'}</button>`:'';box.classList.toggle('hidden',!pending)}
 }
 function makeOfflineSaleRecord(method){
  const fields={tanggal:$('kTanggal')?.value||dateInput(),noStruk:String($('kStruk')?.value||'').trim(),customer:$('kCustomer')?.value||'Umum',discountPercent:Number($('kDisc')?.value||0),taxPercent:Number($('kTax')?.value||0),metodePembayaran:method,jenisTransaksi:$('kJenisTransaksi')?.value||'Tanpa Resep',noResep:$('kNoResep')?.value||'',items:CART.map(x=>({ProdukID:x.ProdukID,Qty:Number(x.Qty),HargaJual:Number(x.HargaJual)}))};
  if(!fields.noStruk)fields.noStruk='OFF-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,7).toUpperCase();
  const totals=getKasirTotals();
- return {id:fields.noStruk,status:'PENDING',createdAt:new Date().toISOString(),payload:fields,receipt:{noStruk:fields.noStruk,gross:totals.subtotal,discount:totals.discount,tax:totals.tax,total:totals.total,metodePembayaran:method,jenisTransaksi:fields.jenisTransaksi,noResep:fields.noResep,offlinePending:true,items:CART.map(x=>({nama:x.nama,qty:Number(x.Qty),harga:Number(x.HargaJual),subtotal:Number(x.Qty)*Number(x.HargaJual)}))}};
+ return {id:fields.noStruk,idempotencyKey:'OFFLINE-'+fields.noStruk,source:'offline-cashier-v2',status:'PENDING',createdAt:new Date().toISOString(),cacheSavedAt:(()=>{try{return JSON.parse(localStorage.getItem(tenantStorageKey_(OFFLINE_MASTER_KEY))||'{}').savedAt||null}catch(_){return null}})(),payload:fields,receipt:{noStruk:fields.noStruk,gross:totals.subtotal,discount:totals.discount,tax:totals.tax,total:totals.total,metodePembayaran:method,jenisTransaksi:fields.jenisTransaksi,noResep:fields.noResep,offlinePending:true,items:CART.map(x=>({nama:x.nama,qty:Number(x.Qty),harga:Number(x.HargaJual),subtotal:Number(x.Qty)*Number(x.HargaJual)}))}};
 }
 function queueOfflineSale(method,received){
  const record=makeOfflineSaleRecord(method);if(method==='Cash'&&received!=null){record.receipt.uangDiterima=Number(received);record.receipt.kembalian=Math.max(0,Number(received)-record.receipt.total)}
@@ -5120,7 +5119,7 @@ async function syncOfflineSales(includeFailed=false){
     const result=await call('saveSale',TOKEN,item.payload);
     item.status='SYNCED';item.syncedAt=new Date().toISOString();item.serverResult={noStruk:result.noStruk,total:result.total};item.error='';changed=true;
    }catch(e){
-    item.status='FAILED';item.error=String(e?.message||e);item.lastAttemptAt=new Date().toISOString();changed=true;
+    item.status=isNetworkFailure(e)?'UNKNOWN':'FAILED';item.error=item.status==='UNKNOWN'?'Hasil sinkronisasi tidak dapat dipastikan. Server mungkin sudah menyimpan transaksi; periksa riwayat server dan jangan kirim ulang otomatis. '+String(e?.message||e):String(e?.message||e);item.lastAttemptAt=new Date().toISOString();changed=true;
     // A failed validation (e.g. stock changed) needs operator review; it is not silently retried.
    }
    offlineQueueWrite(queue);
@@ -7498,7 +7497,7 @@ window.addEventListener('message',function(event){
    let task;
    try{task=Promise.resolve(submitUnifiedBarcode(code,'camera-popup','kasir',{cameraToDecodeMs:data.cameraToDecodeMs,cameraSessionElapsedMs:data.cameraSessionElapsedMs,decodeProcessingMs:data.decodeProcessingMs,detectedAt:data.detectedAt,scannerSessionId:BARCODE_SCANNER_SESSION_ID}));}
    catch(error){task=Promise.reject(error)}
-   task.then(result=>{entry.status='completed';entry.success=!!result;entry.message=result?'Produk berhasil ditambahkan ke keranjang.':'Produk tidak ditemukan, stok habis, atau persyaratan transaksi belum terpenuhi.';entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',entry.success,entry.message)})
+   task.then(result=>{const outcome=window.__APOTEK_LAST_BARCODE_OUTCOME__||{};entry.status='completed';entry.success=!!result;entry.outcome=String(outcome.result|| (result?'added_to_cart':'unknown'));entry.failureCode=String(outcome.failureCode||'');entry.message=result?'Produk berhasil ditambahkan ke keranjang.':barcodeOutcomeMessage_(entry.outcome);entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',entry.success,entry.message)})
     .catch(error=>{entry.status='completed';entry.success=false;entry.message=String(error?.message||error||'Gagal memproses barcode.');entry.updatedAt=Date.now();barcodeLedgerWrite_();ack('completed',false,entry.message)});
   }else submitUnifiedBarcode(code,'camera-popup',BARCODE_SCAN_MODE);
   return;
@@ -7602,8 +7601,10 @@ function unifiedBarcodeAccept_(raw,source='manual'){
 /* ================= BARCODE PERFORMANCE INSTRUMENTATION — STAGE A/B =================
  * Client-side timing only; records durations, never barcode values or credentials.
  */
+function barcodeOutcomeMessage_(kind){const messages={lookup_timeout:'Pencarian server timeout. Status produk belum dapat dipastikan; periksa keranjang sebelum mencoba lagi.',network_error:'Koneksi server terputus. Status produk belum dapat dipastikan.',backend_error:'Server mengalami kesalahan saat mencari produk. Status produk belum dapat dipastikan.',invalid_backend_response:'Respons server tidak valid. Status produk belum dapat dipastikan.',lookup_endpoint_unavailable:'Endpoint pencarian barcode belum tersedia pada backend.',product_not_found:'Barcode tidak ditemukan pada Master Produk.',out_of_stock:'Stok produk habis menurut data yang tersedia.',insufficient_stock:'Stok tidak mencukupi menurut data yang tersedia.',prescription_required:'Produk memerlukan transaksi resep.',prescription_number_required:'Nomor resep wajib dilengkapi.',offline_lookup_unavailable:'Produk tidak ditemukan pada cache lokal. Status produk belum dapat dipastikan.',added_to_cart:'Produk berhasil ditambahkan ke keranjang.'};return messages[String(kind||'')]||'Pemrosesan barcode belum dapat dipastikan. Periksa keranjang dan riwayat transaksi.';}
 function barcodePerfNow_(){return (window.performance&&performance.now)?performance.now():Date.now();}
 function recordBarcodePerf_(entry){
+ window.__APOTEK_LAST_BARCODE_OUTCOME__={result:String(entry.result||'unknown'),failureCode:String(entry.failureCode||''),at:Date.now()};
  const item={at:new Date().toISOString(),mode:String(entry.mode||'kasir'),source:String(entry.source||'unknown'),cameraToDecodeMs:entry.cameraToDecodeMs!==null&&entry.cameraToDecodeMs!==undefined&&Number.isFinite(Number(entry.cameraToDecodeMs))?Number(entry.cameraToDecodeMs):null,cameraSessionElapsedMs:entry.cameraSessionElapsedMs!==null&&entry.cameraSessionElapsedMs!==undefined&&Number.isFinite(Number(entry.cameraSessionElapsedMs))?Number(entry.cameraSessionElapsedMs):null,decodeProcessingMs:entry.decodeProcessingMs!==null&&entry.decodeProcessingMs!==undefined&&Number.isFinite(Number(entry.decodeProcessingMs))?Number(entry.decodeProcessingMs):null,scannerHandoffMs:entry.scannerHandoffMs!==null&&entry.scannerHandoffMs!==undefined&&Number.isFinite(Number(entry.scannerHandoffMs))?Number(entry.scannerHandoffMs):null,localLookupMs:Number(entry.localLookupMs||0),serverLookupMs:Number(entry.serverLookupMs||0),serverReportedMs:Number(entry.serverReportedMs||0),serverTiming:entry.serverTiming&&typeof entry.serverTiming==='object'?entry.serverTiming:null,gatewayTrace:entry.gatewayTrace&&typeof entry.gatewayTrace==='object'?entry.gatewayTrace:null,bridgeTrace:entry.bridgeTrace&&typeof entry.bridgeTrace==='object'?entry.bridgeTrace:null,validationMs:Number(entry.validationMs||0),cartRenderMs:Number(entry.cartRenderMs||0),totalClientMs:Number(entry.totalClientMs||0),lookupPath:String(entry.lookupPath||'none'),result:String(entry.result||'unknown'),failureCode:String(entry.failureCode||'')};
  try{const key=tenantStorageKey_('apotek_barcode_perf_v2');const rows=JSON.parse(localStorage.getItem(key)||'[]');rows.push(item);while(rows.length>100)rows.shift();localStorage.setItem(key,JSON.stringify(rows));}catch(_){}
  try{console.info('[APOTEK_BARCODE_PERF_V2]',item);}catch(_){}
@@ -7678,11 +7679,20 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
    else if(code==='NETWORK_ERROR'||/koneksi internet tidak tersedia|perangkat sedang offline/i.test(msg)){perf.result='network_error';perf.failureCode='NETWORK_ERROR';}
    else if(code==='INVALID_LOOKUP_RESPONSE'){perf.result='invalid_backend_response';perf.failureCode='INVALID_BACKEND_RESPONSE';}
    else {perf.result='backend_error';perf.failureCode=code||'BACKEND_ERROR';}
-   perf.lookupPath='indexed_server_single_request_error';
-   perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
-   const userMessage=perf.result==='lookup_timeout'?'Pencarian produk belum mendapat respons dari server. Status produk belum dapat dipastikan. Periksa koneksi lalu coba pencarian kembali; jangan anggap produk tidak terdaftar.':perf.result==='network_error'?'Koneksi ke server tidak tersedia. Status produk belum dapat dipastikan.':perf.result==='lookup_endpoint_unavailable'?'Fitur pencarian barcode cepat belum tersedia pada deployment backend. Perbarui backend dan deploy versi terbaru.':perf.result==='invalid_backend_response'?'Server mengirim respons pencarian yang tidak valid. Produk belum dapat dipastikan.':'Terjadi kesalahan saat mencari produk pada server. Status produk belum dapat dipastikan.';
-   if($('kResults'))$('kResults').innerHTML='<span class="error">'+esc(userMessage)+'</span>';
-   setKasirBarcodeWarning_(userMessage,'error');barcodeBeep(false);barcodePill('Pencarian produk belum dapat dipastikan',false);return null;
+   // Bila lookup jaringan gagal tetapi snapshot tenant memiliki produk ini,
+   // lanjutkan dengan cache sebagai data STALE dan tampilkan peringatan yang eksplisit.
+   if(p&&isNetworkFailure(lookupError)){
+    OFFLINE_MODE=true;perf.lookupPath='local_offline_cache_fallback';perf.result='offline_cache_hit';perf.failureCode='STALE_CACHE';
+    perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
+    setKasirBarcodeWarning_('Server tidak dapat dijangkau. Produk ditemukan pada cache lokal ('+new Date().toLocaleString()+'); harga/stok mungkin berubah. Penjualan akan masuk antrean lokal dan perlu validasi stok saat sinkronisasi.','warning');
+    if($('kResults'))$('kResults').innerHTML='<span class="warning">Data produk dari cache lokal · status stok terakhir, belum diverifikasi server.</span>';
+   }else{
+    perf.lookupPath='indexed_server_single_request_error';
+    perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
+    const userMessage=perf.result==='lookup_timeout'?'Pencarian server timeout. Status produk belum dapat dipastikan; jangan anggap produk tidak terdaftar.':perf.result==='network_error'?'Koneksi ke server tidak tersedia. Status produk belum dapat dipastikan.':perf.result==='lookup_endpoint_unavailable'?'Fitur pencarian barcode cepat belum tersedia pada deployment backend. Perbarui backend dan deploy versi terbaru.':perf.result==='invalid_backend_response'?'Server mengirim respons pencarian yang tidak valid. Produk belum dapat dipastikan.':'Terjadi kesalahan saat mencari produk pada server. Status produk belum dapat dipastikan.';
+    if($('kResults'))$('kResults').innerHTML='<span class="error">'+esc(userMessage)+'</span>';
+    setKasirBarcodeWarning_(userMessage,'error');barcodeBeep(false);barcodePill('Pencarian produk belum dapat dipastikan',false);return null;
+   }
   }
  }else if(p){perf.lookupPath='local_offline_cache';}
  if(scannerSessionId&&!isBarcodeScannerSessionCurrent_(scannerSessionId)){perf.result='scanner_session_closed';perf.failureCode='SCANNER_SESSION_CLOSED';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);return null;}
@@ -7724,7 +7734,7 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
   if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
   if($('kResults'))$('kResults').innerHTML=`<span class="badge green">✓ ${esc(p.NamaProduk)} | Qty ${existing?existing.Qty:1} | Stok ${p.Stok} | ${money(p.HargaJual)}</span>`;
-  setKasirBarcodeWarning_(Number(p.StokKedaluwarsa||0)>0?'Produk '+p.NamaProduk+' ditambahkan. Terdapat stok batch kedaluwarsa yang tidak dapat dijual; periksa detail batch sebelum posting.':'Produk '+p.NamaProduk+' berhasil ditambahkan ke keranjang.','success');
+  setKasirBarcodeWarning_(OFFLINE_MODE?'Produk '+p.NamaProduk+' ditambahkan dari cache lokal. Stok/harga belum diverifikasi server; transaksi akan berstatus PENDING.':(Number(p.StokKedaluwarsa||0)>0?'Produk '+p.NamaProduk+' ditambahkan. Terdapat stok batch kedaluwarsa yang tidak dapat dijual; periksa detail batch sebelum posting.':'Produk '+p.NamaProduk+' berhasil ditambahkan ke keranjang.'),OFFLINE_MODE?'warning':'success');
   const cartStart=barcodePerfNow_();renderCart();scheduleKasirDraftSave();perf.cartRenderMs=barcodePerfNow_()-cartStart;barcodeBeep(true);barcodePill(p.NamaProduk+' ditambahkan · Qty '+(existing?existing.Qty:1));
   perf.result='added_to_cart';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);
   return p;
@@ -8252,7 +8262,7 @@ async function finishCashPayment(){
   if(OFFLINE_MODE||!navigator.onLine){queueOfflineSale('Cash',received);return;}
   let r;
   try{r=await postKasirSale('Cash');}
-  catch(e){if(isNetworkFailure(e)){OFFLINE_MODE=true;queueOfflineSale('Cash',received);return;}throw e;}
+  catch(e){if(isNetworkFailure(e)){OFFLINE_MODE=true;customAlert('Hasil posting belum dapat dipastikan. Transaksi TIDAK dimasukkan otomatis ke antrean offline karena server mungkin sudah menyimpannya. Periksa riwayat penjualan dan nomor struk sebelum tindakan berikutnya.');return;}throw e;}
   r.uangDiterima=received;r.kembalian=received-Number(r.total??t.total);
   closeModal();completeKasirSaleUI(r);
   // Buka preview setelah render ulang kasir selesai agar tidak tertimpa pembaruan DOM.
@@ -8290,7 +8300,7 @@ async function checkout(){
   if(OFFLINE_MODE||!navigator.onLine){queueOfflineSale(method);return;}
   let r;
   try{r=await postKasirSale(method);}
-  catch(e){if(isNetworkFailure(e)){OFFLINE_MODE=true;queueOfflineSale(method);return;}throw e;}
+  catch(e){if(isNetworkFailure(e)){OFFLINE_MODE=true;customAlert('Hasil posting belum dapat dipastikan. Transaksi TIDAK dimasukkan otomatis ke antrean offline karena server mungkin sudah menyimpannya. Periksa riwayat penjualan dan nomor struk sebelum tindakan berikutnya.');return;}throw e;}
   completeKasirSaleUI(r);
   // Jadwalkan preview setelah UI kasir selesai diperbarui.
   requestAnimationFrame(()=>setTimeout(()=>printReceipt(r),60));
