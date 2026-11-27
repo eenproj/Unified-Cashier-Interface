@@ -1,10 +1,16 @@
-/* APOTEK PWA API Bridge Client v1.8.1 — Gateway Response Delivery Diagnostics & Transport Recovery C3.2.
- * Adds response-delivery telemetry, robust duplicate ACK correlation, and bounded transport diagnostics.
+/* APOTEK PWA API Bridge Client v1.9.1 — Runtime Initialization & Deployment Consistency C3.3.1.
+ * Based on C3.3 Gateway Iframe Lifecycle Optimization.
+ * Adds fail-safe initialization status and deterministic runtime diagnostics.
  * Fast barcode lookup remains read-only and is never automatically retried.
- * Diagnostics contain no credentials, request payloads, or barcode values.
  */
 (() => {
   "use strict";
+  const initStartedAt = Date.now();
+  window.ApotekApiBridgeStatus = {
+    state: "INITIALIZING", version: "1.9.1-runtime-init-c3.3.1",
+    startedAt: new Date(initStartedAt).toISOString(), completedAt: null, error: null
+  };
+  try {
   const cfg = window.APOTEK_PWA_CONFIG || {};
   const endpoint = String(cfg.gasWebAppUrl || "").trim();
   const pending = new Map();
@@ -547,7 +553,7 @@
     return restorePromise;
   }
   const bridge = {
-    version:"1.9.0-gateway-iframe-pool-c3.3",
+    version:"1.9.1-runtime-init-c3.3.1",
     getLifecycleSummary() {
       const counts = {};
       for (const item of lifecycle.values()) counts[item.state]=(counts[item.state]||0)+1;
@@ -585,5 +591,13 @@
   };
   window.ApotekApiBridge = Object.freeze(bridge);
   window.ApotekApiBridgeDiagnostics = Object.freeze({ lifecycle:() => bridge.getLifecycleSummary(), get:() => bridge.getDiagnostics(), getPersistent:() => bridge.getPersistentDiagnostics(), transport:() => bridge.getTransportDiagnostics(), frames:() => bridge.getFramePoolSummary(), last:() => bridge.getLastDiagnostic(), pending:() => bridge.getPendingSummary(), clear:() => { try { localStorage.removeItem("apotek_pwa_bridge_diag_v1"); } catch (_) {} return bridge.clearDiagnostics(); } });
-  record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin });
+  window.ApotekApiBridgeStatus = { state:"READY", version:bridge.version, startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:null };
+  try { record("BRIDGE_INITIALIZED", { version:bridge.version, endpointConfigured:validEndpoint(endpoint), pageOrigin:location.origin, initDurationMs:Date.now()-initStartedAt }); } catch (diagnosticError) {
+    try { console.warn("[APOTEK_PWA_BRIDGE] Initialization succeeded; diagnostic persistence failed.", diagnosticError); } catch (_) {}
+  }
+  } catch (error) {
+    const detail = { name:String(error && error.name || "Error"), message:String(error && error.message || error).slice(0,500), stack:String(error && error.stack || "").slice(0,1800), at:new Date().toISOString() };
+    window.ApotekApiBridgeStatus = { state:"FAILED", version:"1.9.1-runtime-init-c3.3.1", startedAt:new Date(initStartedAt).toISOString(), completedAt:new Date().toISOString(), error:detail };
+    try { console.error("[APOTEK_PWA_BRIDGE] BRIDGE_INITIALIZATION_FAILED", detail); } catch (_) {}
+  }
 })();
