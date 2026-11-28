@@ -7892,7 +7892,7 @@ async function processBarcodeInput(raw,mode='kasir',source='manual',perfMeta){
   if(source==='camera-popup'&&requestId&&!barcodeCommitIntent_(requestId,p.ID)){perf.result='duplicate_suppressed';perf.failureCode='REQUEST_COMMIT_ALREADY_CLAIMED';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);return null;}
   const nextQty=Number(existing?.Qty||0)+1;if(nextQty>Number(p.Stok||0)){if(source==='camera-popup'&&requestId)barcodeCommitFinalize_(requestId,'uncertain');perf.validationMs=barcodePerfNow_()-validationStart;perf.result='insufficient_stock';perf.totalClientMs=barcodePerfNow_()-started;recordBarcodePerf_(perf);const stockMessage='Stok tidak mencukupi untuk '+p.NamaProduk+'. Stok tersedia: '+p.Stok+'.';if(mode==='kasir')setKasirBarcodeWarning_(stockMessage,'error');barcodeBeep(false);barcodePill('Stok tidak mencukupi: '+p.NamaProduk,false);customAlert(stockMessage);return null}
   perf.validationMs=barcodePerfNow_()-validationStart;
-  if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'});
+  if(existing){existing.Qty=nextQty;existing.StokTersedia=Number(p.Stok||0);if(existing._serverPriceAtAdd==null)existing._serverPriceAtAdd=Number(p.HargaJual||0)}else CART.push({ProdukID:p.ID,nama:p.NamaProduk,Qty:1,HargaJual:Number(p.HargaJual||0),SatuanID:p.SatuanID,StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas',_serverPriceAtAdd:Number(p.HargaJual||0),_serverVerifiedAtAdd:Date.now()});
   if(source==='camera-popup'&&requestId)barcodeCommitFinalize_(requestId,'committed');
   if($('kProduk'))$('kProduk').value='';if($('kBarcodeManual'))$('kBarcodeManual').value='';if($('kHarga'))$('kHarga').value='';if($('kQty'))$('kQty').value=1;
   if($('kResults'))$('kResults').innerHTML=`<span class="badge green">✓ ${esc(p.NamaProduk)} | Qty ${existing?existing.Qty:1} | Stok ${p.Stok} | ${money(p.HargaJual)}</span>`;
@@ -8126,7 +8126,7 @@ async function addCart(){
  if(existing)existing.Qty=Number(existing.Qty||0)+qty;
  else CART.push({
   ProdukID:p.ID,nama:p.NamaProduk,Qty:qty,HargaJual:price,SatuanID:p.SatuanID,
-  StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas'
+  StokTersedia:Number(p.Stok||0),JenisObat:p.JenisObat||'Bebas',_serverPriceAtAdd:Number(p.HargaJual||0),_serverVerifiedAtAdd:Date.now()
  });
  window._kasirProduct=null;
  $('kProduk').value='';$('kHarga').value='';
@@ -8418,21 +8418,47 @@ async function finishCashPayment(){
   requestAnimationFrame(()=>setTimeout(()=>printReceipt(r),60));
   showToast('Penjualan berhasil: '+r.metodePembayaran+' | Kembalian '+money(r.kembalian));
  }catch(e){
-  if(!handleExpiredCartCheckoutError_(e))customAlert(e.message||String(e));
+  if(!handleExpiredCartCheckoutError_(e)){const msg=String(e?.message||e||'');customAlert(msg.startsWith('CART_RECONCILIATION_REQUIRED::')?msg.slice('CART_RECONCILIATION_REQUIRED::'.length):msg);}
   if(btn){btn.disabled=false;btn.textContent='Selesaikan & Cetak Struk';}
  }finally{window._cashPosting=false;}
 }
 
 
+async function validateKasirCartWithServer_(){
+ if(!navigator.onLine||OFFLINE_MODE)throw new Error('Server tidak dapat diverifikasi. Transaksi online ditahan; gunakan antrean offline jika memang diperlukan.');
+ const requestItems=CART.map(x=>({ProdukID:String(x.ProdukID),Qty:Number(x.Qty||0)}));
+ const result=await call('validateSaleCart',TOKEN,requestItems);
+ if(!result||result.ok!==true||!Array.isArray(result.items))throw new Error('Respons validasi keranjang dari server tidak valid.');
+ const byId=new Map(result.items.map(x=>[String(x.ProdukID),x]));
+ const issues=[],snapshots=[];
+ for(const item of CART){
+  const server=byId.get(String(item.ProdukID));
+  if(!server||server.active!==true){issues.push((item.nama||item.ProdukID)+': produk tidak ditemukan atau tidak aktif di server.');continue;}
+  const qty=Number(item.Qty||0),available=Number(server.StokLayak||0);
+  if(qty>available){issues.push((item.nama||server.NamaProduk)+': diminta '+qty+', stok layak server '+available+'.');continue;}
+  const previousMaster=Number(item._serverPriceAtAdd??item.HargaJual??0),latestMaster=Number(server.HargaJual||0);
+  if(Math.abs(previousMaster-latestMaster)>0.000001){
+   const wasUsingMaster=Math.abs(Number(item.HargaJual||0)-previousMaster)<0.000001;
+   if(wasUsingMaster)item.HargaJual=latestMaster;
+   item._serverPriceAtAdd=latestMaster;item._serverVerifiedAtAdd=Date.now();
+   issues.push((item.nama||server.NamaProduk)+': harga master berubah dari '+money(previousMaster)+' menjadi '+money(latestMaster)+(wasUsingMaster?' (harga keranjang diperbarui).':' (harga khusus keranjang dipertahankan).'));
+  }
+  item.StokTersedia=available;item.nama=server.NamaProduk||item.nama;
+  snapshots.push({ProdukID:String(item.ProdukID),HargaJual:latestMaster});
+ }
+ if(issues.length){renderCart();scheduleKasirDraftSave();const message='Keranjang perlu ditinjau sebelum transaksi:\n• '+issues.join('\n• ')+'\n\nPeriksa kembali harga dan jumlah, kemudian tekan posting sekali lagi.';throw new Error('CART_RECONCILIATION_REQUIRED::'+message);}
+ return {validatedAt:result.validatedAt||new Date().toISOString(),priceSnapshot:snapshots,serverRevision:result.revision||''};
+}
 async function postKasirSale(method){
+ const verified=await validateKasirCartWithServer_();
  const payload={
   tanggal:$('kTanggal').value,noStruk:$('kStruk').value,customer:$('kCustomer').value,
   discountPercent:$('kDisc').value,taxPercent:$('kTax').value,metodePembayaran:method,
   jenisTransaksi:$('kJenisTransaksi').value,noResep:$('kNoResep')?.value||'',
+  serverPriceSnapshot:verified.priceSnapshot,serverValidatedAt:verified.validatedAt,serverRevision:verified.serverRevision,
   items:CART.map(x=>({ProdukID:x.ProdukID,Qty:Number(x.Qty),HargaJual:Number(x.HargaJual)}))
  };
- const result=await call('saveSale',TOKEN,payload);
- // Metadata kasir berasal dari payload yang sudah diposting; tidak perlu read-back database.
+ let result;try{result=await call('saveSale',TOKEN,payload)}catch(error){const raw=String(error?.message||error||'');if(raw.includes('SERVER_PRICE_CHANGED::')){let detail={};try{detail=JSON.parse(raw.slice(raw.indexOf('SERVER_PRICE_CHANGED::')+'SERVER_PRICE_CHANGED::'.length))}catch(e){}const item=CART.find(x=>String(x.ProdukID)===String(detail.ProdukID));if(item){const old=Number(item._serverPriceAtAdd??item.HargaJual??0),latest=Number(detail.HargaServerTerakhir||0);if(Math.abs(Number(item.HargaJual||0)-old)<0.000001)item.HargaJual=latest;item._serverPriceAtAdd=latest;}renderCart();scheduleKasirDraftSave();throw new Error('CART_RECONCILIATION_REQUIRED::Harga master berubah saat transaksi sedang diproses. Keranjang telah diperbarui; periksa kembali sebelum posting ulang.');}throw error;}
  return {...result,tanggal:payload.tanggal,customer:payload.customer};
 }
 
@@ -8455,7 +8481,7 @@ async function checkout(){
   requestAnimationFrame(()=>setTimeout(()=>printReceipt(r),60));
   showToast('Penjualan berhasil: '+r.metodePembayaran+postIntegrityToastText_(r));
  }catch(e){
-  if(!handleExpiredCartCheckoutError_(e))customAlert(e.message||String(e));
+  if(!handleExpiredCartCheckoutError_(e)){const msg=String(e?.message||e||'');customAlert(msg.startsWith('CART_RECONCILIATION_REQUIRED::')?msg.slice('CART_RECONCILIATION_REQUIRED::'.length):msg);}
   if(btn){btn.disabled=false;btn.textContent='POSTING PENJUALAN & CETAK STRUK';}
  }finally{window._cashPosting=false;}
 }
